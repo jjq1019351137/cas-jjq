@@ -31,9 +31,33 @@ class TaskSuggestionItemOut(BaseModel):
     datetime: str | None = None
     channel: str | None = None
     source: str | None = None
+    source_key: str | None = None
 
 
 class TaskSuggestionListOut(BaseModel):
     success: bool = True
     data: list[TaskSuggestionItemOut] = []
     message: str | None = None
+
+
+class TaskSuggestionVerifyIn(BaseModel):
+    shareurls: list[str] = Field(min_length=1, max_length=200)
+    account_name: str | None = Field(default=None, max_length=128)
+
+
+class TaskSuggestionVerifyItemOut(BaseModel):
+    shareurl: str
+    drive_type: str | None = None
+    ok: bool = False
+    message: str | None = None
+    pdir_fid: str | None = None
+    max_file_size: int | None = None
+    latest_video: dict | None = None
+    is_largest: bool = False
+
+
+class TaskSuggestionVerifyOut(BaseModel):
+    items: list[TaskSuggestionVerifyItemOut] = []
+    total: int = 0
+    valid: int = 0
+    invalid: int = 0

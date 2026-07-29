@@ -1,15 +1,14 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
   X, Eye, Loader2, ChevronDown, ChevronUp, Folder, FolderOpen, Search,
   Play, ArrowUp, ArrowDown, FileText, ChevronLeft, ChevronRight, RefreshCw, GripVertical, BookOpen,
 } from 'lucide-vue-next'
 import { previewShare, previewShareBatch, browseDrive, fetchTasks } from '@/api/tasks'
-import { fetchTaskSuggestions } from '@/api/resourceSearch'
 import type { TaskSuggestionItem } from '@/types/resourceSearch'
+import ResourceSearchDialog from '@/components/business/drama/ResourceSearchDialog.vue'
 import { searchTMDB, fetchTMDBDetail } from '@/api/media'
 import { useToast } from '@/composables/useToast'
 import { useCreateTaskMutation, useUpdateTaskMutation } from '@/hooks/mutations/tasks'
@@ -127,14 +126,8 @@ const savepathLastApplied = ref('')
 const tmdbDetailCache = ref<Record<string, any>>({})
 const isInitializing = ref(false)
 
-// Resource search suggestions state
-const taskSuggestions = reactive({
-  visible: false,
-  loading: false,
-  items: [] as TaskSuggestionItem[],
-  searchTimer: null as ReturnType<typeof setTimeout> | null,
-  message: '',
-})
+// Resource search dialog state
+const showResourceSearch = ref(false)
 
 // Plugin expand state
 const expandedPlugins = ref(new Set<string>())
@@ -293,11 +286,8 @@ watch(
     savepathTouched.value = Boolean(task)
     savepathLastApplied.value = ''
     autoLocateRunId.value += 1
-    // 清空搜索建议
-    taskSuggestions.visible = false
-    taskSuggestions.items = []
-    taskSuggestions.message = ''
-    taskSuggestions.loading = false
+    // 关闭资源搜索弹窗
+    showResourceSearch.value = false
     if (shouldOpenTmdbSearch && nextTmdbQuery) {
       nextTick(() => {
         doTmdbSearch().catch(() => {})
@@ -1106,113 +1096,38 @@ function resetAndClose() {
   emit('close')
 }
 
-// ===== Resource Search Suggestions =====
-function scheduleLightSearch() {
-  if (!state.taskname?.trim() || state.taskname.trim().length < 2) {
-    taskSuggestions.visible = false
-    return
+// ===== Resource Search Dialog =====
+// 已指定账号 → 该账号网盘类型；自动+已填分享链接 → 链接推断类型；均无则不限定单一类型
+const resourceSearchDriveType = computed(() => {
+  if (state.account_choice !== '__AUTO__') {
+    const acc = (accountsData.value || []).find(a => String(a.name) === state.account_choice)
+    const dt = String(acc?.drive_type || '').trim()
+    if (dt) return dt
   }
-  if (taskSuggestions.searchTimer) clearTimeout(taskSuggestions.searchTimer)
-  taskSuggestions.searchTimer = setTimeout(() => searchSuggestions(0), 1000)
+  const byUrl = detectDriveTypeByUrl(state.shareurl)
+  return byUrl ? String(byUrl) : null
+})
+
+// 新增任务且未确定类型时，按已有可用账号类型限定搜索范围
+const resourceSearchDriveTypes = computed(() => {
+  const out: string[] = []
+  for (const a of accountsData.value || []) {
+    if (a.enabled === false) continue
+    const status = String((a as any).runtime_status || '').trim()
+    if (status && status !== 'active') continue
+    const dt = String(a.drive_type || '').trim()
+    if (dt && !out.includes(dt)) out.push(dt)
+  }
+  return out
+})
+
+function openResourceSearch() {
+  showResourceSearch.value = true
 }
 
-async function searchSuggestions(deep: 0 | 1) {
-  const q = state.taskname?.trim()
-  if (!q || q.length < 2) return
-
-  taskSuggestions.loading = true
-  taskSuggestions.visible = true
-  taskSuggestions.message = ''
-  try {
-    const dt = currentDriveType()
-    const res = await fetchTaskSuggestions(q, deep, dt)
-    taskSuggestions.items = res?.data || []
-    taskSuggestions.message = res?.message || ''
-    // 搜索完成后自动验证链接有效性
-    if (taskSuggestions.items.length) {
-      verifySuggestions()
-    }
-  } catch {
-    taskSuggestions.items = []
-    taskSuggestions.message = '搜索失败'
-  } finally {
-    taskSuggestions.loading = false
-  }
-}
-
-async function verifySuggestions() {
-  const items = taskSuggestions.items
-  if (!items.length) return
-
-  // 按网盘类型分组
-  const groups = new Map<string, Array<{ item: TaskSuggestionItem; url: string }>>()
-  for (const item of items) {
-    const url = item.shareurl
-    if (!url) continue
-    const dt = detectDriveTypeByUrl(url) || 'other'
-    if (!groups.has(dt)) groups.set(dt, [])
-    groups.get(dt)!.push({ item, url })
-  }
-
-  // 逐组并发验证，每组完成立即更新UI
-  const promises = [...groups.values()].map(async (group) => {
-    const urls = group.map(g => g.url)
-    try {
-      const res = await previewShareBatch({ shareurls: urls })
-      if (res?.items) {
-        for (const { item, url } of group) {
-          const row = res.items.find((r: any) => r.shareurl === url || r.url === url)
-          if (row) {
-            item.verify = Boolean(row.ok)
-            // 记录最大视频文件大小
-            if (row.latest_video?.size) item.maxFileSize = row.latest_video.size
-          } else {
-            item.verify = false
-          }
-        }
-      }
-    } catch {
-      // 该组验证失败，标记为未知
-    }
-    // 每组完成后触发响应式更新
-    taskSuggestions.items = [...taskSuggestions.items]
-  })
-
-  await Promise.allSettled(promises)
-
-  // 所有验证完成后，按大小排序并标记最大的
-  markLargestAndSort()
-}
-
-function markLargestAndSort() {
-  const items = taskSuggestions.items
-  const verified = items.filter(i => i.verify === true && i.maxFileSize)
-
-  // 清除旧的 max 标记
-  for (const item of items) item.isLargest = false
-
-  if (verified.length) {
-    // 找到最大的
-    verified.sort((a, b) => (b.maxFileSize || 0) - (a.maxFileSize || 0))
-    verified[0].isLargest = true
-
-    // 排序：有效的按大小降序排前面，失效的排后面
-    taskSuggestions.items = [
-      ...items.filter(i => i.verify === true).sort((a, b) => (b.maxFileSize || 0) - (a.maxFileSize || 0)),
-      ...items.filter(i => i.verify !== true),
-    ]
-  }
-}
-
-function selectSuggestion(item: TaskSuggestionItem) {
-  taskSuggestions.visible = false
+function onResourceSelected(item: TaskSuggestionItem) {
   state.shareurl = item.shareurl // 填充分享链接，会触发自动定位
-}
-
-function hideSuggestionsDelayed() {
-  setTimeout(() => {
-    taskSuggestions.visible = false
-  }, 200)
+  if (!state.taskname?.trim() && item.taskname) state.taskname = item.taskname
 }
 
 // ===== Helpers =====
@@ -1462,58 +1377,14 @@ function getTmdbPoster(item: TMDBBrief): string {
               <div>
                 <label class="mb-1.5 block text-sm font-medium text-[hsl(var(--foreground))]">任务名称</label>
                 <div class="relative">
-                  <Input v-model="state.taskname" placeholder="可选，默认从预览自动提取"
-                    @input="scheduleLightSearch"
-                    @focus="state.taskname?.trim()?.length >= 2 && (taskSuggestions.visible = true)"
-                    @blur="hideSuggestionsDelayed" />
-                  <Button v-if="state.taskname?.trim()?.length >= 2"
+                  <Input v-model="state.taskname" placeholder="可选，默认从预览自动提取" class="pr-24" />
+                  <Button
                     size="sm" variant="ghost"
                     class="absolute right-1 top-1/2 -translate-y-1/2 h-7 text-xs"
-                    :disabled="taskSuggestions.loading"
-                    @click="searchSuggestions(1)">
+                    @click="openResourceSearch">
                     <Search class="h-3 w-3 mr-1" />
                     搜索资源
                   </Button>
-                </div>
-
-                <!-- 搜索建议面板 -->
-                <div v-if="taskSuggestions.visible && (taskSuggestions.items.length || taskSuggestions.loading || taskSuggestions.message)"
-                  class="mt-1.5 rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] shadow-md max-h-60 overflow-y-auto">
-                  <!-- Loading -->
-                  <div v-if="taskSuggestions.loading" class="flex items-center justify-center py-3 text-xs text-[hsl(var(--muted-foreground))]">
-                    <Loader2 class="h-3.5 w-3.5 animate-spin mr-1.5" /> 搜索中...
-                  </div>
-                  <!-- 提示消息 -->
-                  <div v-if="taskSuggestions.message" class="px-3 py-1.5 text-xs text-[hsl(var(--muted-foreground))] border-b border-[hsl(var(--border))]">
-                    {{ taskSuggestions.message }}
-                  </div>
-                  <!-- 结果列表 -->
-                  <div v-for="(item, idx) in taskSuggestions.items" :key="idx"
-                    class="px-3 py-2 cursor-pointer hover:bg-[hsl(var(--accent))] border-b border-[hsl(var(--border))] last:border-0"
-                    @mousedown.prevent="selectSuggestion(item)">
-                    <div class="flex items-center justify-between gap-2">
-                      <span class="text-sm font-medium truncate">{{ item.taskname }}</span>
-                      <div class="flex items-center gap-1 shrink-0">
-                        <Badge v-if="item.isLargest" variant="outline" class="text-[10px] bg-amber-50 text-amber-600 border-amber-200">最大</Badge>
-                        <span v-if="item.maxFileSize" class="text-[10px] text-[hsl(var(--muted-foreground))]">{{ formatSize(item.maxFileSize) }}</span>
-                        <Badge v-if="item.verify === true" variant="outline" class="text-[10px] text-green-600 border-green-300">有效</Badge>
-                        <Badge v-else-if="item.verify === false" variant="outline" class="text-[10px] text-red-500 border-red-300">失效</Badge>
-                        <Badge v-if="item.source" variant="outline" class="text-[10px]">{{ item.source }}</Badge>
-                      </div>
-                    </div>
-                    <!-- 链接可点击跳转 -->
-                    <a :href="item.shareurl" target="_blank" rel="noopener"
-                      class="text-xs text-[hsl(var(--primary))] hover:underline mt-0.5 block truncate"
-                      @mousedown.stop @click.stop>{{ item.shareurl }}</a>
-                    <div class="flex items-center gap-2 mt-0.5">
-                      <span v-if="item.datetime" class="text-[10px] text-[hsl(var(--muted-foreground))]">{{ item.datetime }}</span>
-                      <span v-if="item.channel" class="text-[10px] text-[hsl(var(--muted-foreground))]">{{ item.channel }}</span>
-                    </div>
-                  </div>
-                  <!-- 无结果 -->
-                  <div v-if="!taskSuggestions.loading && !taskSuggestions.items.length && !taskSuggestions.message" class="px-3 py-3 text-xs text-center text-[hsl(var(--muted-foreground))]">
-                    无搜索结果
-                  </div>
                 </div>
               </div>
 
@@ -1920,6 +1791,15 @@ function getTmdbPoster(item: TMDBBrief): string {
         </div>
       </div>
     </Transition>
+
+    <!-- 资源搜索弹窗 -->
+    <ResourceSearchDialog
+      v-model:visible="showResourceSearch"
+      :initial-query="state.taskname || ''"
+      :drive-type="resourceSearchDriveType"
+      :drive-types="resourceSearchDriveTypes"
+      @select="onResourceSelected"
+    />
   </Teleport>
 </template>
 

@@ -54,7 +54,7 @@ from app.schemas.task import (
     TaskStatusIn,
     TaskUpdateIn,
 )
-from app.schemas.resource_search import TaskSuggestionListOut
+from app.schemas.resource_search import TaskSuggestionListOut, TaskSuggestionVerifyIn, TaskSuggestionVerifyOut
 from app.schemas.task_repair import RepairBannedTasksOut
 from app.services import audit
 from app.services.notifications.sender import send_runtime
@@ -67,7 +67,7 @@ from app.services.drive_browse import browse_drive_directory
 from app.services.drama_update_progress import build_drama_update_progress
 from app.services.drama_share_repair import repair_banned_drama_tasks
 from app.services.task_scheduler import get_or_create_task_scheduler_setting, update_task_scheduler_setting
-from app.services.resource_search import fetch_task_suggestions
+from app.services.resource_search import fetch_task_suggestions, verify_task_suggestions
 from app.services.tasks import create_task, delete_task, get_task, list_tasks_recent_executions, set_task_enabled, update_task
 from app.services.tmdb_settings import get_or_create_tmdb_setting, get_tmdb_runtime_config
 
@@ -435,15 +435,32 @@ def list_magic_regex(db: Session = Depends(get_db)) -> MagicRegexOut:
 
 
 @router.get("/suggestions", response_model=TaskSuggestionListOut, dependencies=[Depends(require_permissions(TASK_READ))])
-def get_task_suggestions(q: str = "", d: int = 0, drive_type: str = "", db: Session = Depends(get_db)) -> TaskSuggestionListOut:
+def get_task_suggestions(
+    q: str = "",
+    d: int = 0,
+    drive_type: str = "",
+    drive_types: str = "",
+    sources: str = "",
+    db: Session = Depends(get_db),
+) -> TaskSuggestionListOut:
     try:
         dt = str(drive_type or "").strip() or None
-        items, changed, msg = fetch_task_suggestions(db, keyword=q, deep=d, drive_type=dt)
+        dts = str(drive_types or "").strip() or None
+        src = str(sources or "").strip() or None
+        items, changed, msg = fetch_task_suggestions(db, keyword=q, deep=d, drive_type=dt, drive_types=dts, sources=src)
         if changed:
             db.commit()
         return TaskSuggestionListOut(success=True, data=items, message=msg)
     except Exception as e:
         return TaskSuggestionListOut(success=True, message=f"error: {str(e)}", data=[])
+
+
+@router.post("/suggestions/verify", response_model=TaskSuggestionVerifyOut, dependencies=[Depends(require_permissions(TASK_READ))])
+def post_verify_task_suggestions(payload: TaskSuggestionVerifyIn, db: Session = Depends(get_db)) -> TaskSuggestionVerifyOut:
+    result, changed = verify_task_suggestions(db, payload.shareurls, account_name=payload.account_name)
+    if changed:
+        db.commit()
+    return TaskSuggestionVerifyOut(**result)
 
 
 def _bool_is_dir(payload: dict) -> bool:

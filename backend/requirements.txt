@@ -20,3 +20,4 @@ guessit==3.8.0
 emoji==2.12.1
 grpcio==1.81.0
 protobuf==6.33.5
+pymysql==1.1.1

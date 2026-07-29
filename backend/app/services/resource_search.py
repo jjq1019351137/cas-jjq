@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
-import os
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-import requests
+import requests  # noqa: F401  测试与旧代码通过 rs.requests 打桩，保留导入
 from sqlalchemy import or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -19,123 +16,28 @@ from app.extensions.runtime.adapter_registry import AdapterRegistry
 from app.models.drive_account import DriveAccount
 from app.models.resource_search_source import ResourceSearchSource
 from app.services.invalid_share_links import list_invalid_shareurls
+from app.services.resource_search_providers import (  # noqa: F401  向后兼容再导出
+    EXTERNAL_TIMEOUT,
+    SUPPORTED_CLOUD_TYPES,
+    CloudSaverClient,
+    PanSouClient,
+    ProviderResult,
+    SearchProvider,
+    _iso_to_cst,
+    _log_debug,
+    _normalize_drive_type,
+    _pansou_cloud_type,
+    get_provider,
+    iter_providers,
+    provider_keys,
+    register_provider,
+)
 
 
-SOURCE_KEYS = ("net", "cloudsaver", "pansou")
-EXTERNAL_TIMEOUT = (15, 200)
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CLOUD_TYPES = {
-    "quark",
-    "pan123",
-    "pan115",
-    "cloud115",
-    "uc",
-    "tianyi",
-    "cloud189",
-    "aliyun",
-    "xunlei",
-    "baidupan",
-    "baidu",
-}
-
-
-def _normalize_drive_type(value: str | None) -> str | None:
-    v = str(value or "").strip()
-    if not v:
-        return None
-    k = v.lower()
-    mapping = {
-        "pan115": "115",
-        "cloud115": "115",
-        "115": "115",
-        "pan123": "123pan",
-        "123pan": "123pan",
-        "tianyi": "cloud189",
-        "cloud189": "cloud189",
-        "baidupan": "baidu",
-        "baidu": "baidu",
-        "quark": "quark",
-        "uc": "uc",
-        "aliyun": "aliyun",
-        "xunlei": "xunlei",
-    }
-    return mapping.get(k) or k
-
-
-def _pansou_cloud_type(value: str | None) -> str | None:
-    dt = _normalize_drive_type(value)
-    if not dt:
-        return None
-    mapping = {
-        "115": "115",
-        "123pan": "pan123",
-        "cloud189": "tianyi",
-        "baidu": "baiduPan",
-        "quark": "quark",
-        "uc": "uc",
-        "aliyun": "aliyun",
-        "xunlei": "xunlei",
-        "cloud139" : "mobile",
-        "guangya": "guangya"
-    }
-    return mapping.get(dt)
-
-
-def _debug_enabled() -> bool:
-    return os.getenv("DEBUG", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _mask_secret(value: str, keep: int = 2) -> str:
-    v = str(value or "").strip()
-    if not v:
-        return ""
-    if len(v) <= keep:
-        return "*" * len(v)
-    return v[:keep] + "*" * (len(v) - keep)
-
-
-def _redact(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        out: dict[str, Any] = {}
-        for k, v in obj.items():
-            key = str(k).lower()
-            if key in {"password", "passwd"}:
-                out[k] = "***"
-            elif key in {"token", "access_token", "refresh_token", "authorization"}:
-                out[k] = _mask_secret(str(v), keep=4)
-            elif key in {"cookie", "cookies"}:
-                out[k] = "***"
-            else:
-                out[k] = _redact(v)
-        return out
-    if isinstance(obj, list):
-        return [_redact(x) for x in obj]
-    return obj
-
-
-def _truncate_text(text: str, max_chars: int = 20000) -> str:
-    if max_chars <= 0:
-        return text
-    if len(text) <= max_chars:
-        return text
-    head = text[: max_chars // 2]
-    tail = text[-max_chars // 2 :]
-    return f"{head}\n... (truncated, total_chars={len(text)}) ...\n{tail}"
-
-
-def _log_debug(label: str, payload: Any) -> None:
-    if not (_debug_enabled() or logger.isEnabledFor(logging.DEBUG)):
-        return
-    try:
-        text = json.dumps(_redact(payload), ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        text = repr(_redact(payload))
-    msg = f"{label}={_truncate_text(text)}"
-    if _debug_enabled():
-        logger.info(msg)
-    else:
-        logger.debug(msg)
+# 搜索源 key 列表由插件注册表驱动，新增搜索源只需注册 SearchProvider 插件
+SOURCE_KEYS = provider_keys()
 
 
 def _loads(value: str) -> dict[str, Any]:
@@ -159,11 +61,11 @@ def ensure_default_sources(db: Session) -> dict[str, ResourceSearchSource]:
         ResourceSearchSource.__table__.create(bind=engine, checkfirst=True)
         existing = {r.key: r for r in db.execute(select(ResourceSearchSource)).scalars().all()}
     changed = False
-    for key in SOURCE_KEYS:
+    for provider in iter_providers():
+        key = provider.key
         if key in existing:
             continue
-        enabled = True if key == "net" else False
-        row = ResourceSearchSource(key=key, enabled=enabled, config_json=_dumps({}))
+        row = ResourceSearchSource(key=key, enabled=bool(provider.default_enabled), config_json=_dumps({}))
         db.add(row)
         db.flush()
         existing[key] = row
@@ -176,24 +78,20 @@ def ensure_default_sources(db: Session) -> dict[str, ResourceSearchSource]:
 def list_sources(db: Session) -> list[dict[str, Any]]:
     rows = ensure_default_sources(db)
     out: list[dict[str, Any]] = []
-    for key in SOURCE_KEYS:
-        row = rows[key]
+    for provider in iter_providers():
+        row = rows[provider.key]
         cfg = _loads(row.config_json or "")
         item: dict[str, Any] = {"key": row.key, "enabled": bool(row.enabled), "server": None, "username": None, "password": None, "token": None}
-        if key == "cloudsaver":
-            item["server"] = cfg.get("server") or None
-            item["username"] = cfg.get("username") or None
-            item["token"] = cfg.get("token") or None
-            item["password"] = None
-        elif key == "pansou":
-            item["server"] = cfg.get("server") or None
+        for f in provider.public_fields:
+            item[f] = cfg.get(f) or None
         out.append(item)
     return out
 
 
 def update_source(db: Session, key: str, payload: dict[str, Any]) -> ResourceSearchSource:
     key = str(key or "").strip()
-    if key not in SOURCE_KEYS:
+    provider = get_provider(key)
+    if provider is None:
         raise bad_request("RESOURCE_SEARCH_SOURCE_INVALID", "不支持的搜索源")
 
     rows = ensure_default_sources(db)
@@ -203,249 +101,67 @@ def update_source(db: Session, key: str, payload: dict[str, Any]) -> ResourceSea
     if "enabled" in payload and payload["enabled"] is not None:
         row.enabled = bool(payload["enabled"])
 
-    if key == "net":
-        row.config_json = _dumps(cfg)
-        db.flush()
-        return row
+    for f in provider.config_fields:
+        if f in payload and payload[f] is not None:
+            cfg[f] = str(payload[f] or "").strip()
 
-    if "server" in payload and payload["server"] is not None:
-        cfg["server"] = str(payload["server"] or "").strip()
-
-    if key == "pansou":
-        row.config_json = _dumps(cfg)
-        db.flush()
-        return row
-
-    if "username" in payload and payload["username"] is not None:
-        cfg["username"] = str(payload["username"] or "").strip()
-    if "token" in payload and payload["token"] is not None:
-        cfg["token"] = str(payload["token"] or "").strip()
-
-    if "password" in payload and payload["password"] is not None:
-        pw = str(payload["password"] or "")
-        if pw.strip():
-            cfg["password"] = pw
+    for f in provider.secret_fields:
+        if f in payload and payload[f] is not None:
+            secret = str(payload[f] or "")
+            if secret.strip():
+                cfg[f] = secret
 
     row.config_json = _dumps(cfg)
     db.flush()
     return row
 
 
-def _iso_to_cst(iso_time_str: str) -> str:
-    from datetime import datetime, timezone, timedelta
-
-    try:
-        dt = datetime.fromisoformat(str(iso_time_str))
-        dt_cst = dt if dt > datetime.now() else dt
-        return dt_cst.strftime("%Y-%m-%d %H:%M:%S") if dt_cst.year >= 1970 else ""
-    except Exception:
-        return ""
-
-
-class CloudSaverClient:
-    def __init__(self, server: str):
-        self.server = server.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-
-    def set_auth(self, username: str, password: str, token: str = "") -> None:
-        self.username = username
-        self.password = password
-        self.token = token
-        if token:
-            self.session.headers.update({"Authorization": f"Bearer {token}"})
-        else:
-            self.session.headers.pop("Authorization", None)
-
-    def login(self) -> dict[str, Any]:
-        url = f"{self.server}/api/user/login"
-        _log_debug("[cloudsaver.login] request", {"url": url, "username": self.username})
-        res = self.session.post(url, json={"username": self.username, "password": self.password}, timeout=EXTERNAL_TIMEOUT)
-        data = res.json()
-        _log_debug("[cloudsaver.login] response", {"status_code": res.status_code, "json": data})
-        if data.get("success"):
-            token = ((data.get("data") or {}).get("token")) or ""
-            self.token = token
-            self.session.headers.update({"Authorization": f"Bearer {token}"})
-            return {"success": True, "token": token}
-        return {"success": False, "message": data.get("message") or "CloudSaver 登录失败"}
-
-    def search(self, keyword: str, last_message_id: str = "") -> dict[str, Any]:
-        url = f"{self.server}/api/search"
-        _log_debug("[cloudsaver.search] request", {"url": url, "keyword": keyword, "lastMessageId": last_message_id})
-        res = self.session.get(url, params={"keyword": keyword, "lastMessageId": last_message_id})
-        data = res.json()
-        _log_debug("[cloudsaver.search] response", {"status_code": res.status_code, "json": data})
-        if data.get("success"):
-            return {"success": True, "data": data.get("data") or []}
-        return {"success": False, "message": data.get("message") or "CloudSaver 搜索失败"}
-
-    def auto_login_search(self, keyword: str) -> dict[str, Any]:
-        if not getattr(self, "token", None):
-            r = self.login()
-            if not r.get("success"):
-                return r
-            token = r.get("token") or ""
-            search = self.search(keyword)
-            if search.get("success"):
-                search["new_token"] = token
-            return search
-
-        search = self.search(keyword)
-        if search.get("success"):
-            return search
-        r = self.login()
-        if not r.get("success"):
-            return search
-        token = r.get("token") or ""
-        search = self.search(keyword)
-        if search.get("success"):
-            search["new_token"] = token
-        return search
-
-    def clean_search_results(self, search_results: Any, keyword: str | None = None) -> list[dict[str, Any]]:
-        links: list[dict[str, Any]] = []
-        if not isinstance(search_results, list):
-            return links
-        link_set: set[str] = set()
-        keyword = str(keyword or "").strip()
-
-        def _strip_html(text: str) -> str:
-            if not text:
-                return ""
-            t = str(text).replace('<mark class="highlight">', "").replace("</mark>", "")
-            return re.sub(r"<[^>]+>", "", t)
-
-        def _title_contains_keyword(title: str) -> bool:
-            if not keyword:
-                return True
-            title = (_strip_html(title) or "").strip()
-            if match := re.search(r"(名称|标题)[：:]?(.*)", title, re.DOTALL):
-                title = (match.group(2) or "").strip()
-            title_norm = re.sub(r"\s+", "", title).lower()
-            tokens = [t for t in re.split(r"\s+", keyword) if t]
-            return all(re.sub(r"\s+", "", t).lower() in title_norm for t in tokens)
-
-        enable_filter = os.getenv("CLOUDSAVER_TITLE_FILTER", "1").strip() != "0"
-
-        for ch in search_results:
-            if not isinstance(ch, dict):
-                continue
-            channel = ch.get("channel") or ch.get("name") or ""
-            for item in (ch.get("list") or []):
-                if not isinstance(item, dict):
-                    continue
-                if enable_filter and not _title_contains_keyword(str(item.get("title") or "")):
-                    continue
-                title = _strip_html(item.get("title") or "").strip() or ""
-                if keyword and not _title_contains_keyword(title):
-                    continue
-                desc = _strip_html(item.get("desc") or item.get("content") or "").strip() or ""
-                tm = item.get("datetime") or item.get("time") or ""
-                if tm:
-                    tm = _iso_to_cst(str(tm))
-                cloud_links = item.get("cloudLinks") or item.get("cloud_links") or []
-                if not isinstance(cloud_links, list):
-                    continue
-                for cl in cloud_links:
-                    if not isinstance(cl, dict):
-                        continue
-                    url = str(cl.get("url") or cl.get("link") or "").strip()
-                    if not url or url in link_set:
-                        continue
-                    drive = str(cl.get("cloudType") or cl.get("type") or "").lower()
-                    if drive and drive not in SUPPORTED_CLOUD_TYPES:
-                        continue
-                    link_set.add(url)
-                    links.append(
-                        {
-                            "shareurl": url,
-                            "taskname": title,
-                            "content": desc,
-                            "datetime": tm,
-                            "channel": str(channel),
-                            "source": "CloudSaver",
-                        }
-                    )
-        return links
+def _normalize_source_keys(sources: list[str] | str | None) -> set[str] | None:
+    """归一化渠道过滤参数；返回 None 表示不过滤（全部启用的搜索源）。"""
+    if sources is None:
+        return None
+    if isinstance(sources, str):
+        parts = [x.strip() for x in sources.split(",")]
+    else:
+        parts = [str(x or "").strip() for x in sources]
+    keys = {x.lower() for x in parts if x}
+    keys = {x for x in keys if get_provider(x) is not None}
+    return keys or None
 
 
-class PanSouClient:
-    def __init__(self, server: str):
-        self.server = server.rstrip("/")
-        self.session = requests.Session()
+def _normalize_drive_types(values: list[str] | str | None) -> list[str]:
+    """归一化网盘类型集合（保序去重）。"""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        parts = [x.strip() for x in values.split(",")]
+    else:
+        parts = [str(x or "").strip() for x in values]
+    out: list[str] = []
+    for p in parts:
+        dt = _normalize_drive_type(p)
+        if dt and dt not in out:
+            out.append(dt)
+    return out
 
-    def search(self, keyword: str, refresh: bool = False, *, drive_type: str | None = None) -> list[dict[str, Any]]:
-        try:
-            url = f"{self.server}/api/search"
-            cloud_type = _pansou_cloud_type(drive_type)
-            params = {
-                "kw": keyword,
-                "cloud_types": [cloud_type]
-                if cloud_type
-                else ["quark", "pan123", "pan115", "uc", "tianyi", "aliyun", "xunlei", "baiduPan"],
-                "res": "merge",
-                "refresh": bool(refresh),
-            }
-            res = self.session.get(url, params=params, timeout=EXTERNAL_TIMEOUT)
-            data = res.json()
-            if data.get("code") != 0:
-                return []
-            merged = (data.get("data") or {}).get("merged_by_type") or {}
-            items: Any = []
-            if cloud_type:
-                keys: list[str] = [cloud_type, cloud_type.lower()]
-                if cloud_type == "tianyi":
-                    keys.extend(["cloud189", "tianyi"])
-                elif cloud_type == "pan115":
-                    keys.extend(["cloud115", "pan115", "115"])
-                elif cloud_type == "pan123":
-                    keys.extend(["123pan", "pan123"])
-                elif cloud_type == "baiduPan":
-                    keys.extend(["baidupan", "baidu"])
-                for k in keys:
-                    if isinstance(merged, dict) and isinstance(merged.get(k), list):
-                        items = merged.get(k) or []
-                        break
-            if not items:
-                items = (merged.get("quark") if isinstance(merged, dict) else None) or []
-            return self.format_search_results(items)
-        except Exception:
-            return []
 
-    def format_search_results(self, search_results: Any) -> list[dict[str, Any]]:
-        import re
-
-        if not isinstance(search_results, list):
-            return []
-        pattern = r"^(.*?)(?:[【\[]?(?:简介|介绍|描述)[】\]]?[:：]?)?(.*)$"
-        out: list[dict[str, Any]] = []
-        link_set: set[str] = set()
-        for item in search_results:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url") or "").strip()
-            if not url or url in link_set:
-                continue
-            note = str(item.get("note") or "")
-            tm = str(item.get("datetime") or "")
-            if tm:
-                tm = _iso_to_cst(tm)
-            m = re.search(pattern, note, re.DOTALL)
-            title = (m.group(1) if m else note).strip()
-            content = (m.group(2) if m else "").strip()
-            link_set.add(url)
-            out.append(
-                {
-                    "shareurl": url,
-                    "taskname": title,
-                    "content": content,
-                    "datetime": tm,
-                    "channel": str(item.get("source") or ""),
-                    "source": "PanSou",
-                }
+def list_available_drive_types(db: Session) -> list[str]:
+    """当前可用（enabled 且 runtime_status 非异常）的网盘账号类型集合。"""
+    raw = (
+        db.execute(
+            select(DriveAccount.drive_type).where(
+                DriveAccount.enabled.is_(True),
+                or_(
+                    DriveAccount.runtime_status == "active",
+                    DriveAccount.runtime_status.is_(None),
+                    DriveAccount.runtime_status == "",
+                ),
             )
-        return out
+        )
+        .scalars()
+        .all()
+    )
+    return sorted({dt for dt in (_normalize_drive_type(x) for x in raw) if dt})
 
 
 def fetch_task_suggestions(
@@ -455,102 +171,93 @@ def fetch_task_suggestions(
     *,
     filter_invalid: bool = True,
     drive_type: str | None = None,
+    drive_types: list[str] | str | None = None,
+    sources: list[str] | str | None = None,
 ) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """聚合多渠道资源搜索。
+
+    drive_type：单一强制网盘类型（已指定账号、或自动+已填分享链接推断出的类型）。
+    drive_types：候选网盘类型集合；与 drive_type 均为空时默认取当前可用网盘账号类型，
+    使搜索请求本身就只面向已有账号的网盘，而不是先宽搜再丢弃。
+    """
     keyword = str(keyword or "").strip()
     if len(keyword) < 2:
         return ([], False, None)
     deep = deep or 0
     dt_filter = _normalize_drive_type(drive_type)
-    _log_debug("[suggestions] request", {"keyword": keyword, "deep": deep, "drive_type": dt_filter})
+    source_filter = _normalize_source_keys(sources)
 
-    rows = ensure_default_sources(db)
-    cfg_net = _loads(rows["net"].config_json or "")
-    cfg_cs = _loads(rows["cloudsaver"].config_json or "")
-    cfg_ps = _loads(rows["pansou"].config_json or "")
+    enabled_drive_types = list_available_drive_types(db)
+    if not enabled_drive_types:
+        return ([], False, "没有可用的网盘账号（enabled=true 且 runtime_status=active），已隐藏不支持的资源")
+    if dt_filter and dt_filter not in enabled_drive_types:
+        return ([], False, f"指定网盘类型没有可用账号：{dt_filter}")
+
+    requested_types = _normalize_drive_types(drive_types)
+    if dt_filter:
+        search_drive_types = [dt_filter]
+    elif requested_types:
+        search_drive_types = [x for x in requested_types if x in enabled_drive_types] or list(enabled_drive_types)
+    else:
+        search_drive_types = list(enabled_drive_types)
+    allowed_drive_types = set(search_drive_types)
+
     _log_debug(
-        "[suggestions] sources",
+        "[suggestions] request",
         {
-            "net": {"enabled": bool(rows["net"].enabled), "config": cfg_net},
-            "cloudsaver": {"enabled": bool(rows["cloudsaver"].enabled), "config": cfg_cs},
-            "pansou": {"enabled": bool(rows["pansou"].enabled), "config": cfg_ps},
+            "keyword": keyword,
+            "deep": deep,
+            "drive_type": dt_filter,
+            "search_drive_types": search_drive_types,
+            "sources": sorted(source_filter) if source_filter else None,
         },
     )
 
-    def net_search():
-        try:
-            def clean_search_results(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-                out: list[dict[str, Any]] = []
-                for item in items:
-                    if isinstance(item, dict):
-                        out.append(item)
-                return out
-            if not rows["net"].enabled:
-                return []
-            base_url = base64.b64decode("aHR0cHM6Ly9wYW5zZWFyY2guMTIzY2YudG9w").decode()
-            url = f"{base_url}/task_suggestions"
-            r = requests.get(url, params={"q": keyword.lower(), "d": str(deep)}, timeout=EXTERNAL_TIMEOUT)
-            data = r.json()
+    rows = ensure_default_sources(db)
+    configs = {p.key: _loads(rows[p.key].config_json or "") for p in iter_providers()}
+    _log_debug(
+        "[suggestions] sources",
+        {p.key: {"enabled": bool(rows[p.key].enabled), "config": configs[p.key]} for p in iter_providers()},
+    )
 
-            if isinstance(data, dict):
-                items = data.get("data") if isinstance(data.get("data"), list) else []
-                return clean_search_results(items)
-            return []
-        except Exception:
-            return []
+    active_providers = [
+        p
+        for p in iter_providers()
+        if bool(rows[p.key].enabled) and (source_filter is None or p.key in source_filter)
+    ]
 
-    def cs_search():
+    def _run_provider(provider: SearchProvider) -> tuple[str, ProviderResult]:
         try:
-            if not rows["cloudsaver"].enabled:
-                return ([], None)
-            server = str(cfg_cs.get("server") or "").strip()
-            username = str(cfg_cs.get("username") or "").strip()
-            password = str(cfg_cs.get("password") or "")
-            token = str(cfg_cs.get("token") or "")
-            if not (server and username and password):
-                return ([], None)
-            cs = CloudSaverClient(server)
-            cs.set_auth(username=username, password=password, token=token)
-            search = cs.auto_login_search(keyword.lower())
-            if not search.get("success"):
-                return ([], None)
-            new_token = search.get("new_token") or None
-            _log_debug("[cloudsaver.search] raw_data", search.get("data"))
-            results = cs.clean_search_results(search.get("data"), keyword=keyword.lower())
-            _log_debug("[cloudsaver.search] cleaned_results", {"count": len(results), "items": results[:20]})
-            return (results, new_token)
+            result = provider.search(
+                keyword,
+                deep,
+                drive_type=dt_filter,
+                drive_types=search_drive_types,
+                config=configs.get(provider.key),
+            )
         except Exception:
-            return ([], None)
-
-    def ps_search():
-        try:
-            if not rows["pansou"].enabled:
-                return []
-            server = str(cfg_ps.get("server") or "").strip()
-            if not server:
-                return []
-            ps = PanSouClient(server)
-            return ps.search(keyword.lower(), refresh=deep == 1, drive_type=dt_filter)
-        except Exception:
-            return []
+            result = ProviderResult()
+        return (provider.key, result)
 
     search_results: list[dict[str, Any]] = []
-    new_token: str | None = None
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(net_search), executor.submit(cs_search), executor.submit(ps_search)]
-        for fut in as_completed(futures):
-            try:
-                r = fut.result()
-            except Exception:
-                continue
-            if isinstance(r, tuple):
-                items, tok = r
-                if tok:
-                    new_token = str(tok)
-                if isinstance(items, list):
-                    search_results.extend([x for x in items if isinstance(x, dict)])
-                continue
-            if isinstance(r, list):
-                search_results.extend([x for x in r if isinstance(x, dict)])
+    new_tokens: dict[str, str] = {}
+    if active_providers:
+        with ThreadPoolExecutor(max_workers=max(1, len(active_providers))) as executor:
+            futures = [executor.submit(_run_provider, p) for p in active_providers]
+            for fut in as_completed(futures):
+                try:
+                    key, result = fut.result()
+                except Exception:
+                    continue
+                if result.new_token:
+                    new_tokens[key] = str(result.new_token)
+                provider = get_provider(key)
+                for item in result.items:
+                    if not isinstance(item, dict):
+                        continue
+                    item.setdefault("source", provider.display_name if provider else key)
+                    item["source_key"] = key
+                    search_results.append(item)
 
     results: list[dict[str, Any]] = []
     link_set: set[str] = set()
@@ -568,29 +275,12 @@ def fetch_task_suggestions(
         results.append(item)
 
     token_updated = False
-    if new_token:
-        cfg_cs["token"] = new_token
-        rows["cloudsaver"].config_json = _dumps(cfg_cs)
+    for key, token in new_tokens.items():
+        cfg = configs.get(key) or {}
+        cfg["token"] = token
+        rows[key].config_json = _dumps(cfg)
         db.flush()
         token_updated = True
-
-    enabled_drive_types = set(
-        str(x or "").strip()
-        for x in db.execute(
-            select(DriveAccount.drive_type).where(
-                DriveAccount.enabled.is_(True),
-                or_(DriveAccount.runtime_status == "active", DriveAccount.runtime_status.is_(None), DriveAccount.runtime_status == ""),
-            )
-        )
-        .scalars()
-        .all()
-    )
-    enabled_drive_types = {_normalize_drive_type(x) for x in enabled_drive_types}
-    enabled_drive_types = {x for x in enabled_drive_types if x}
-    if not enabled_drive_types:
-        return ([], token_updated, "没有可用的网盘账号（enabled=true 且 runtime_status=active），已隐藏不支持的资源")
-    if dt_filter and dt_filter not in enabled_drive_types:
-        return ([], token_updated, f"指定网盘类型没有可用账号：{dt_filter}")
 
     filtered: list[dict[str, Any]] = []
     removed_by_accounts = 0
@@ -603,7 +293,7 @@ def fetch_task_suggestions(
         if not dt or str(dt) not in enabled_drive_types:
             removed_by_accounts += 1
             continue
-        if dt_filter and str(dt) != dt_filter:
+        if str(dt) not in allowed_drive_types:
             removed_by_drive_type += 1
             continue
         name = item.get("taskname") if item.get("taskname") else item.get("content", "")
@@ -612,10 +302,12 @@ def fetch_task_suggestions(
 
     message = None
     msg_parts: list[str] = []
+    if source_filter:
+        msg_parts.append(f"已限定搜索渠道：{', '.join(sorted(source_filter))}")
     if dt_filter:
         msg_parts.append(f"已限定网盘类型：{dt_filter}")
-    elif removed_by_accounts:
-        msg_parts.append(f"已按可用网盘账号过滤：{', '.join(sorted(enabled_drive_types))}")
+    elif removed_by_accounts or removed_by_drive_type:
+        msg_parts.append(f"已按可用网盘账号过滤：{', '.join(sorted(allowed_drive_types))}")
     if msg_parts:
         message = "; ".join(msg_parts)
 
@@ -627,3 +319,55 @@ def fetch_task_suggestions(
             message = f"{message}; {extra}" if message else extra
 
     return (filtered, token_updated, message)
+
+
+def verify_task_suggestions(
+    db: Session,
+    shareurls: list[str],
+    *,
+    account_name: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """验证搜索结果分享链接的有效性。
+
+    复用 preview_share_batch（内部按网盘类型分组逐个探测并带随机延迟防限流），
+    并在此基础上汇总最大视频大小标记与有效/失效统计。
+    失效链接会由 preview_share_batch 落库，后续搜索自动过滤。
+    """
+    from app.schemas.task_browse import SharePreviewBatchIn
+    from app.services.share_preview_batch import preview_share_batch
+
+    urls = [str(x or "").strip() for x in (shareurls or [])]
+    urls = list(dict.fromkeys(x for x in urls if x))
+    if not urls:
+        return ({"items": [], "total": 0, "valid": 0, "invalid": 0}, False)
+
+    changed = False
+    items: list[dict[str, Any]] = []
+    # preview_share_batch 单次最多 50 条，超出时分批串行
+    for i in range(0, len(urls), 50):
+        batch = urls[i : i + 50]
+        out, batch_changed = preview_share_batch(db, SharePreviewBatchIn(shareurls=batch, account_name=account_name))
+        changed = changed or batch_changed
+        for row in out.items:
+            latest = row.latest_video.model_dump() if row.latest_video is not None else None
+            size = int(latest.get("size") or 0) if latest else 0
+            items.append(
+                {
+                    "shareurl": row.shareurl,
+                    "drive_type": row.drive_type,
+                    "ok": bool(row.ok),
+                    "message": row.message,
+                    "pdir_fid": row.pdir_fid or row.resolved_pdir_fid or None,
+                    "max_file_size": size or None,
+                    "latest_video": latest,
+                    "is_largest": False,
+                }
+            )
+
+    max_size = max((int(x.get("max_file_size") or 0) for x in items), default=0)
+    if max_size > 0:
+        for x in items:
+            x["is_largest"] = int(x.get("max_file_size") or 0) == max_size
+
+    valid = sum(1 for x in items if x["ok"])
+    return ({"items": items, "total": len(items), "valid": valid, "invalid": len(items) - valid}, changed)

@@ -47,6 +47,7 @@ declare module 'vue' {
     OpenListSection: typeof import('./components/business/settings/system/OpenListSection.vue')['default']
     PluginsSection: typeof import('./components/business/settings/PluginsSection.vue')['default']
     ProxyImageCachePanel: typeof import('./components/business/settings/cache/ProxyImageCachePanel.vue')['default']
+    ResourceSearchDialog: typeof import('./components/business/drama/ResourceSearchDialog.vue')['default']
     ResourceSearchSection: typeof import('./components/business/settings/system/ResourceSearchSection.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
