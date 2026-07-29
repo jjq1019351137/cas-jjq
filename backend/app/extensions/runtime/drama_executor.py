@@ -1133,6 +1133,7 @@ class DramaTaskExecutor:
         tree.create_node(str(self.task_data.get("taskname") or ""), "root")
 
         update_subdir = (self.task_data.get("update_subdir") or "").strip()
+        extra = self.task_data.get("extra") or {}
         mode = str((extra.get("update_subdir_resave_mode") or "none")).strip()
         compiled_subdir = re.compile(update_subdir) if update_subdir else None
 
