@@ -31,10 +31,44 @@ from app.models.sync_execution_file import SyncExecutionFile
 from app.models.sync_file_snapshot import SyncFileSnapshot
 from app.models.sync_task import SyncTask
 from app.models.sync_task_lock import SyncTaskLock
+from app.services import audit
 from app.services.notifications.sync_notify import send_sync_execution_notification
 from app.services.openlist_client_factory import get_openlist_client
 
 logger = logging.getLogger(__name__)
+
+
+def audit_sync_run_exception(
+    exc: Exception,
+    *,
+    task_name: str,
+    task_id: int | None = None,
+    actor: Any = None,
+    source: str = audit.SOURCE_MANUAL,
+    ip: str | None = None,
+) -> None:
+    """同步任务运行异常的审计兜底。
+
+    若异常已由执行器内部审计过（打了 _sync_run_audited 标记）则不重复记录。
+    """
+    if bool(getattr(exc, "_sync_run_audited", False)):
+        return
+    try:
+        message = str(getattr(exc, "message", None) or str(exc) or type(exc).__name__).strip()
+        audit.audit_log_standalone(
+            actor=audit.actor_for_source(actor, source),
+            action="sync_task.run",
+            summary=f"运行同步任务「{task_name}」：失败——{message}",
+            target_type="sync_task",
+            target_id=task_id,
+            target_name=task_name,
+            source=source,
+            success=False,
+            error_message=message,
+            ip=ip,
+        )
+    except Exception as e:
+        logger.debug("[audit] sync_task.run 异常审计写入失败: %s", e)
 
 
 EndpointType = Literal["local", "openlist", "netdisk"]
@@ -213,6 +247,106 @@ class SyncExecutor:
         return self._openlist_client
 
     def run_sync_task(
+        self,
+        task: SyncTask,
+        *,
+        log: ExecutionLog | None = None,
+        strategy_override: dict[str, Any] | None = None,
+        audit_actor: Any = None,
+        audit_source: str = audit.SOURCE_MANUAL,
+        audit_ip: str | None = None,
+        audit_enabled: bool = True,
+    ) -> SyncExecution:
+        """运行同步任务入口：统一在成功/异常出口写入运行审计。"""
+        try:
+            execution = self._run_sync_task_body(
+                task, log=log, strategy_override=strategy_override
+            )
+        except Exception as exc:
+            if audit_enabled:
+                try:
+                    audit_sync_run_exception(
+                        exc,
+                        task_name=str(getattr(task, "name", "") or ""),
+                        task_id=getattr(task, "id", None),
+                        actor=audit_actor,
+                        source=audit_source,
+                        ip=audit_ip,
+                    )
+                    setattr(exc, "_sync_run_audited", True)
+                except Exception:
+                    pass
+            raise
+        if audit_enabled:
+            self._audit_sync_run(
+                task=task, execution=execution, actor=audit_actor,
+                source=audit_source, ip=audit_ip,
+            )
+        return execution
+
+    def _audit_sync_run(
+        self,
+        *,
+        task: SyncTask,
+        execution: SyncExecution,
+        actor: Any = None,
+        source: str = audit.SOURCE_MANUAL,
+        ip: str | None = None,
+    ) -> None:
+        """写入一条同步任务运行审计（成功/中止/失败）。"""
+        try:
+            name = str(getattr(task, "name", "") or "")
+            target_id = getattr(task, "id", None)
+            act = audit.actor_for_source(actor, source)
+            status = str(getattr(execution, "status", "") or "")
+            message = str(getattr(execution, "message", "") or "").strip()
+            run_log = getattr(execution, "run_log", None)
+            success = status == "success"
+
+            copied = deleted = failed = 0
+            try:
+                stats = json.loads(getattr(execution, "stats_json", None) or "{}")
+                copied = int(stats.get("copied_files", 0) or 0)
+                deleted = int(stats.get("deleted_files", 0) or 0)
+                failed = int(stats.get("failed_files", 0) or 0)
+            except Exception:
+                pass
+
+            if success:
+                parts: list[str] = []
+                if copied:
+                    parts.append(f"复制 {copied} 个文件")
+                if deleted:
+                    parts.append(f"删除 {deleted} 个文件")
+                if failed:
+                    parts.append(f"{failed} 个失败")
+                tail = ("，" + "，".join(parts)) if parts else "，无变更"
+                summary = f"运行同步任务「{name}」：成功{tail}"
+                error_message = None
+            elif status in ("cancelled", "aborted", "stopped"):
+                summary = f"运行同步任务「{name}」：已中止" + (f"——{message}" if message else "")
+                error_message = None
+            else:
+                summary = f"运行同步任务「{name}」：失败——{message}"
+                error_message = message or None
+
+            audit.audit_log_standalone(
+                actor=act,
+                action="sync_task.run",
+                summary=summary,
+                target_type="sync_task",
+                target_id=target_id,
+                target_name=name,
+                source=source,
+                detail=run_log,
+                success=success,
+                error_message=error_message,
+                ip=ip,
+            )
+        except Exception as e:  # 审计绝不影响主流程
+            logger.debug("[audit] sync_task.run 审计写入失败: %s", e)
+
+    def _run_sync_task_body(
         self,
         task: SyncTask,
         *,

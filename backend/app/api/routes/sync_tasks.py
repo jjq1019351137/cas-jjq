@@ -464,7 +464,13 @@ def post_run_sync_task(
         raise ApiError(code="SYNC_TASK_RUNNING", message="同步任务正在执行", http_status=409, detail=str(running.id))
     task = get_sync_task(db, sync_task_id)
     db.close()
-    execution = SyncExecutor(db).run_sync_task(task, strategy_override=override)
+    execution = SyncExecutor(db).run_sync_task(
+        task,
+        strategy_override=override,
+        audit_actor=current.user,
+        audit_source=audit.SOURCE_MANUAL,
+        audit_ip=request.client.host if request.client else None,
+    )
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "sync run finished sync_task_id=%s sync_execution_id=%s status=%s stage=%s",
@@ -473,19 +479,6 @@ def post_run_sync_task(
             str(getattr(execution, "status", "") or ""),
             str(getattr(execution, "stage", "") or ""),
         )
-    with SessionLocal() as adb:
-        audit.write_audit_log(
-            adb,
-            actor_user_id=current.user.id,
-            action="sync_task.run",
-            target_type="sync_task",
-            target_id=str(sync_task_id),
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
-            success=execution.status == "success",
-            detail=execution.message,
-        )
-        adb.commit()
     return _execution_out(execution)
 
 
@@ -619,6 +612,8 @@ def post_run_sync_task_stream(
     current: CurrentUser = Depends(get_current_user_scoped),
 ):
     actor_user_id = int(getattr(current.user, "id", 0) or 0)
+    actor_username = str(getattr(current.user, "username", "") or "") or None
+    audit_ip = request.client.host if request.client else None
     init_payload = {"sync_task_id": int(sync_task_id), "started_at": datetime.now().isoformat()}
     with SessionLocal() as adb:
         running = (
@@ -636,17 +631,6 @@ def post_run_sync_task_stream(
         )
         if running is not None:
             raise ApiError(code="SYNC_TASK_RUNNING", message="同步任务正在执行", http_status=409, detail=str(running.id))
-        audit.write_audit_log(
-            adb,
-            actor_user_id=actor_user_id,
-            action="sync_task.run.stream",
-            target_type="sync_task",
-            target_id=str(sync_task_id),
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
-            success=True,
-        )
-        adb.commit()
 
     q: queue.Queue[tuple[str, object]] = queue.Queue()
     done_sentinel = object()
@@ -675,7 +659,14 @@ def post_run_sync_task_stream(
                 )
             with SessionLocal() as wdb:
                 wtask = get_sync_task(wdb, sync_task_id)
-            execution = SyncExecutor(db=None).run_sync_task(wtask, log=log, strategy_override=override)
+            execution = SyncExecutor(db=None).run_sync_task(
+                wtask,
+                log=log,
+                strategy_override=override,
+                audit_actor=audit.user_actor(actor_user_id, actor_username),
+                audit_source=audit.SOURCE_MANUAL,
+                audit_ip=audit_ip,
+            )
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "sync run(stream) finished sync_task_id=%s sync_execution_id=%s status=%s stage=%s",

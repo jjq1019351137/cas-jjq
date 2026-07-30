@@ -15,7 +15,7 @@ class SyncFileSnapshot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     sync_task_id: Mapped[int] = mapped_column(Integer, ForeignKey("sync_tasks.id", ondelete="CASCADE"), index=True, nullable=False)
     side: Mapped[str] = mapped_column(String(16), nullable=False)
-    rel_path: Mapped[str] = mapped_column(Text, nullable=False)
+    rel_path: Mapped[str] = mapped_column(Text().with_variant(String(740), "mysql"), nullable=False)
 
     is_dir: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="0")
     size: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")

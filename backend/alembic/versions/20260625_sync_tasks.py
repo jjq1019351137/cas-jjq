@@ -67,7 +67,7 @@ def upgrade() -> None:
             sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
             sa.Column("sync_task_id", sa.Integer(), nullable=False),
             sa.Column("side", sa.String(length=16), nullable=False),
-            sa.Column("rel_path", sa.Text(), nullable=False),
+            sa.Column("rel_path", sa.Text().with_variant(sa.String(length=740), "mysql"), nullable=False),
             sa.Column("is_dir", sa.Boolean(), nullable=False, server_default="0"),
             sa.Column("size", sa.BigInteger(), nullable=False, server_default="0"),
             sa.Column("modified_at", sa.Float(), nullable=False, server_default="0"),

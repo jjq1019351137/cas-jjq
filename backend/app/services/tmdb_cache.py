@@ -670,7 +670,8 @@ def refresh_expired_cache(
                 TMDBMediaCache.poster_language == poster_language,
                 or_(TMDBMediaCache.expires_at.is_(None), TMDBMediaCache.expires_at <= now),
             )
-            .order_by(TMDBMediaCache.expires_at.asc().nullsfirst())
+            # MySQL 不支持 NULLS FIRST，用 IS NULL 降序前置实现同语义（NULL 最先）
+            .order_by(TMDBMediaCache.expires_at.is_(None).desc(), TMDBMediaCache.expires_at.asc())
             .limit(max(1, int(max_items)))
         )
         .scalars()
@@ -744,7 +745,15 @@ def list_cache(
     total = int(db.execute(select(func.count()).select_from(stmt.subquery())).scalar() or 0)
 
     rows = (
-        db.execute(stmt.order_by(TMDBMediaCache.expires_at.asc().nullsfirst(), TMDBMediaCache.id.desc()).offset((p - 1) * ps).limit(ps))
+        db.execute(
+            stmt.order_by(
+                TMDBMediaCache.expires_at.is_(None).desc(),
+                TMDBMediaCache.expires_at.asc(),
+                TMDBMediaCache.id.desc(),
+            )
+            .offset((p - 1) * ps)
+            .limit(ps)
+        )
         .scalars()
         .all()
     )

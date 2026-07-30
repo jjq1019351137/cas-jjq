@@ -44,7 +44,7 @@ def upgrade() -> None:
             sa.Column("user_id", sa.BigInteger(), nullable=False),
             sa.Column("scene", sa.String(length=64), server_default="home", nullable=False),
             sa.Column("step", sa.String(length=64), server_default="idle", nullable=False),
-            sa.Column("context_json", sa.Text(), server_default="{}", nullable=False),
+            sa.Column("context_json", sa.Text(), server_default=None if op.get_bind().dialect.name == "mysql" else "{}", nullable=False),
             sa.Column("last_message_id", sa.BigInteger(), nullable=True),
             sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
             sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),

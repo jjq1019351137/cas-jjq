@@ -996,8 +996,9 @@ class DramaTaskExecutor:
         if not attempted or not dest_root_fid:
             return
 
-        fid_name: dict[str, str] = {}
-        try:
+        def _snapshot_dest() -> tuple[dict[str, str], dict[str, str]]:
+            by_fid: dict[str, str] = {}
+            by_name: dict[str, str] = {}
             listing = self._ls_dir(dest_root_fid)
             items = (((listing or {}).get("data") or {}).get("list")) or []
             for raw in items:
@@ -1006,15 +1007,31 @@ class DramaTaskExecutor:
                 fid = str(_get_fid(raw) or "").strip()
                 if not fid:
                     continue
-                fid_name[fid] = str(_get_name(raw) or "")
+                name = str(_get_name(raw) or "")
+                by_fid[fid] = name
+                if name:
+                    by_name.setdefault(name, fid)
+            return by_fid, by_name
+
+        def _is_renamed(fid: str, origin: str, target: str, by_fid: dict[str, str], by_name: dict[str, str]) -> bool:
+            if by_fid.get(fid) == target:
+                return True
+            if fid not in by_fid and target in by_name and origin not in by_name:
+                return True
+            return False
+
+        fid_name: dict[str, str] = {}
+        name_fid: dict[str, str] = {}
+        try:
+            fid_name, name_fid = _snapshot_dest()
         except Exception as exc:
             self._line(f"INFO: 重命名校验失败，无法读取目标目录 err={str(exc).strip() or type(exc).__name__}")
             fid_name = {}
+            name_fid = {}
 
         need_retry: list[tuple[str, str, str]] = []
         for fid, origin, target in attempted:
-            current = fid_name.get(fid)
-            if current == target:
+            if _is_renamed(fid, origin, target, fid_name, name_fid):
                 continue
             need_retry.append((fid, origin, target))
 
@@ -1024,7 +1041,9 @@ class DramaTaskExecutor:
             self._line(f"二次校验：待重试 {len(need_retry)}/{len(attempted)}")
             for fid, origin, target in need_retry:
                 self._line(f"重试重命名：{origin} → {target}")
-                if self._rename_one(fid=fid, origin=origin, target=target):
+                # 优先用当前目录中按原始名查到的 fid（path 型 fid 重命名失败后仍有效）
+                retry_fid = name_fid.get(origin) or fid
+                if self._rename_one(fid=retry_fid, origin=origin, target=target):
                     retry_success += 1
                 else:
                     retry_failed += 1
@@ -1032,18 +1051,9 @@ class DramaTaskExecutor:
         final_ok = 0
         final_failed = 0
         try:
-            listing = self._ls_dir(dest_root_fid)
-            items = (((listing or {}).get("data") or {}).get("list")) or []
-            fid_name = {}
-            for raw in items:
-                if _is_dir(raw):
-                    continue
-                fid = str(_get_fid(raw) or "").strip()
-                if not fid:
-                    continue
-                fid_name[fid] = str(_get_name(raw) or "")
-            for fid, _origin, target in attempted:
-                if fid_name.get(fid) == target:
+            fid_name, name_fid = _snapshot_dest()
+            for fid, origin, target in attempted:
+                if _is_renamed(fid, origin, target, fid_name, name_fid):
                     final_ok += 1
                 else:
                     final_failed += 1

@@ -17,7 +17,7 @@ class TelegramBotSession(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     scene: Mapped[str] = mapped_column(String(64), nullable=False, server_default="home")
     step: Mapped[str] = mapped_column(String(64), nullable=False, server_default="idle")
-    context_json: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
+    context_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     last_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

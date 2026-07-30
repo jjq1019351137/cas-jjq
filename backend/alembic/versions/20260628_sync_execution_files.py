@@ -30,7 +30,7 @@ def upgrade() -> None:
         "sync_execution_files",
         sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
         sa.Column("sync_execution_id", sa.Integer(), nullable=False),
-        sa.Column("path", sa.Text(), nullable=False),
+        sa.Column("path", sa.Text().with_variant(sa.String(length=740), "mysql"), nullable=False),
         sa.Column("action", sa.String(length=16), nullable=False),
         sa.Column("status", sa.String(length=16), nullable=False),
         sa.Column("size", sa.BigInteger(), nullable=True),

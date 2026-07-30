@@ -14,12 +14,14 @@ from app.extensions.runtime.adapter_registry import AdapterRegistry
 from app.models.drive_account import DriveAccount
 from app.models.task import Task
 from app.schemas.task_browse import SharePreviewBatchIn
+from app.services import audit
 from app.services.notifications.sender import send_runtime
 from app.services.notifications.task_notify import DRAMA_NOTIFY_TITLE
 from app.services.invalid_share_links import list_invalid_shareurls
 from app.services.drama_share_autoupdate import resolve_drama_shareurl_update
 from app.services.resource_search import fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
+from app.services.title_match import extract_progress, title_matches_names
 from app.services.tmdb_cache import get_tmdb_detail_cached
 
 
@@ -42,6 +44,42 @@ def _clean_keyword(value: str) -> str:
     return v
 
 
+def _collect_tmdb_names(db: Session, task: Task) -> list[str]:
+    tmdb_media_type = str(getattr(task, "tmdb_media_type", "") or "").strip().lower()
+    tmdb_id = getattr(task, "tmdb_id", None)
+    if tmdb_media_type not in {"tv", "movie"} or tmdb_id is None:
+        return []
+    try:
+        configured, detail, _weekdays, _episode_weekdays, _row = get_tmdb_detail_cached(
+            db,
+            media_type=tmdb_media_type,  # type: ignore[arg-type]
+            tmdb_id=int(tmdb_id),
+            force_refresh=False,
+        )
+    except Exception:
+        return []
+    if not configured or not isinstance(detail, dict):
+        return []
+    if tmdb_media_type == "tv":
+        raw_names = [detail.get("name"), detail.get("original_name")]
+    else:
+        raw_names = [detail.get("title"), detail.get("original_title")]
+    names: list[str] = []
+    for raw in raw_names:
+        value = str(raw or "").strip()
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def _pick_match_names(db: Session, task: Task) -> list[str]:
+    names = _collect_tmdb_names(db, task)
+    if names:
+        return names
+    fallback = _clean_keyword(str(getattr(task, "taskname", "") or ""))
+    return [fallback] if len(fallback) >= 2 else []
+
+
 def _pick_search_keywords(db: Session, task: Task) -> list[str]:
     keywords: list[str] = []
     seen: set[str] = set()
@@ -55,26 +93,8 @@ def _pick_search_keywords(db: Session, task: Task) -> list[str]:
         seen.add(v)
         keywords.append(v)
 
-    tmdb_media_type = str(getattr(task, "tmdb_media_type", "") or "").strip().lower()
-    tmdb_id = getattr(task, "tmdb_id", None)
-    if tmdb_media_type in {"tv", "movie"} and tmdb_id is not None:
-        try:
-            configured, detail, _weekdays, _episode_weekdays, _row = get_tmdb_detail_cached(
-                db,
-                media_type=tmdb_media_type,  # type: ignore[arg-type]
-                tmdb_id=int(tmdb_id),
-                force_refresh=False,
-            )
-            if configured and isinstance(detail, dict):
-                if tmdb_media_type == "tv":
-                    add(str(detail.get("name") or ""))
-                    add(str(detail.get("original_name") or ""))
-                else:
-                    add(str(detail.get("title") or ""))
-                    add(str(detail.get("original_title") or ""))
-        except Exception:
-            pass
-
+    for name in _collect_tmdb_names(db, task):
+        add(name)
     add(str(getattr(task, "taskname", "") or ""))
     return keywords
 
@@ -122,13 +142,19 @@ def _pick_drive_type(db: Session, task: Task) -> str | None:
     return None if not dt2 else str(dt2)
 
 
-def repair_banned_drama_tasks(db: Session) -> dict:
+def repair_banned_drama_tasks(
+    db: Session,
+    *,
+    task_ids: set[int] | None = None,
+    audit_actor: object = None,
+    audit_source: str = audit.SOURCE_AUTO,
+) -> dict:
+    """修复封禁/失效的追剧任务分享链接。task_ids 非空时仅处理指定任务（单任务手动运行后触发）。"""
     debug = _debug_enabled()
-    rows = (
-        db.execute(select(Task).where(Task.enabled.is_(True), Task.task_type == "drama").order_by(Task.id.asc()))
-        .scalars()
-        .all()
-    )
+    stmt = select(Task).where(Task.enabled.is_(True), Task.task_type == "drama")
+    if task_ids:
+        stmt = stmt.where(Task.id.in_([int(x) for x in task_ids]))
+    rows = db.execute(stmt.order_by(Task.id.asc())).scalars().all()
     logger.info("[repair] start scanned=%s", len(rows))
     if debug:
         logger.debug(f"[repair] scanned_rows={len(rows)}")
@@ -231,66 +257,81 @@ def repair_banned_drama_tasks(db: Session) -> dict:
                 )
                 continue
 
+            match_names = _pick_match_names(db, task)
             suggestions: list[dict] = []
-            changed = False
-            _msg = None
-            for kw in _pick_search_keywords(db, task):
-                suggestions, changed, _msg = fetch_task_suggestions(db, keyword=kw, deep=1)
-                if debug:
-                    logger.debug(
-                        f"[repair] task_id={task_id} keyword={kw} suggestions_count={len(suggestions or [])} msg={str(_msg or '')}"
-                    )
-                if suggestions:
-                    break
-            if changed:
-                db_changed = True
-            logger.info(
-                "[repair] suggestions task_id=%s keyword=%s count=%s msg=%s",
-                task_id,
-                kw if "kw" in locals() else "",
-                len(suggestions or []),
-                str(_msg or ""),
-            )
             candidate_urls: list[str] = []
+            candidate_titles: dict[str, str] = {}
             seen: set[str] = set()
             removed_same = 0
             removed_mismatch = 0
             removed_empty = 0
-            for item in suggestions or []:
-                url = str((item or {}).get("shareurl") or "").strip()
-                if not url:
-                    removed_empty += 1
-                    continue
-                if url in seen:
-                    continue
-                if old_shareurl and url == old_shareurl:
-                    if debug:
-                        logger.debug(f"[repair] task_id={task_id} skip_candidate reason=same_as_old url={url}")
-                    removed_same += 1
-                    continue
-                dt = AdapterRegistry.detect_drive_type(url)
-                if dt != drive_type:
-                    if debug:
-                        logger.debug(
-                            f"[repair] task_id={task_id} skip_candidate reason=drive_type_mismatch url={url} dt={dt} expected={drive_type}"
-                        )
-                    removed_mismatch += 1
-                    continue
-                seen.add(url)
-                candidate_urls.append(url)
-                if len(candidate_urls) >= 25:
+            removed_title_mismatch = 0
+            last_kw = ""
+            last_msg = None
+            for kw in _pick_search_keywords(db, task):
+                last_kw = kw
+                # 搜索阶段即限定当前任务的网盘类型，修复只能换同盘链接
+                suggestions, changed, last_msg = fetch_task_suggestions(db, keyword=kw, deep=1, drive_type=drive_type)
+                if changed:
+                    db_changed = True
+                if debug:
+                    logger.debug(
+                        f"[repair] task_id={task_id} keyword={kw} suggestions_count={len(suggestions or [])} msg={str(last_msg or '')}"
+                    )
+                for item in suggestions or []:
+                    url = str((item or {}).get("shareurl") or "").strip()
+                    if not url:
+                        removed_empty += 1
+                        continue
+                    if url in seen:
+                        continue
+                    if old_shareurl and url == old_shareurl:
+                        if debug:
+                            logger.debug(f"[repair] task_id={task_id} skip_candidate reason=same_as_old url={url}")
+                        removed_same += 1
+                        continue
+                    dt = AdapterRegistry.detect_drive_type(url)
+                    if dt != drive_type:
+                        if debug:
+                            logger.debug(
+                                f"[repair] task_id={task_id} skip_candidate reason=drive_type_mismatch url={url} dt={dt} expected={drive_type}"
+                            )
+                        removed_mismatch += 1
+                        continue
+                    title = str((item or {}).get("taskname") or (item or {}).get("content") or "").strip()
+                    if match_names and not title_matches_names(title, match_names):
+                        if debug:
+                            logger.debug(
+                                f"[repair] task_id={task_id} skip_candidate reason=title_mismatch title={title} names={match_names}"
+                            )
+                        removed_title_mismatch += 1
+                        continue
+                    seen.add(url)
+                    candidate_urls.append(url)
+                    candidate_titles[url] = title
+                    if len(candidate_urls) >= 25:
+                        break
+                if candidate_urls:
                     break
+            logger.info(
+                "[repair] suggestions task_id=%s keyword=%s count=%s msg=%s",
+                task_id,
+                last_kw,
+                len(suggestions or []),
+                str(last_msg or ""),
+            )
             if not candidate_urls:
                 if debug:
                     logger.debug(f"[repair] task_id={task_id} no_candidate_urls")
                 logger.info(
-                    "[repair] skip task_id=%s name=%s reason=no_candidate_urls suggestions=%s removed_same=%s removed_mismatch=%s removed_empty=%s",
+                    "[repair] skip task_id=%s name=%s reason=no_candidate_urls suggestions=%s removed_same=%s removed_mismatch=%s removed_empty=%s removed_title_mismatch=%s",
                     task_id,
                     taskname,
                     len(suggestions or []),
                     removed_same,
                     removed_mismatch,
                     removed_empty,
+                    removed_title_mismatch,
                 )
                 continue
             if debug:
@@ -337,13 +378,24 @@ def repair_banned_drama_tasks(db: Session) -> dict:
                 if not bool(getattr(row, "ok", False)):
                     continue
                 latest = getattr(row, "latest_video", None)
-                if latest is None:
+                season = _latest_get(latest, "season") if latest is not None else None
+                episode = _latest_get(latest, "episode") if latest is not None else None
+                size = _latest_get(latest, "size") if latest is not None else None
+                # 部分网盘（如百度）预览不返回季/集，用候选标题解析出的进度兵底，避免退化为任意选一条
+                if season is None or episode is None:
+                    title_season, title_episode = extract_progress(
+                        candidate_titles.get(str(getattr(row, "shareurl", "") or "").strip(), "")
+                    )
+                    season = season if season is not None else title_season
+                    episode = episode if episode is not None else title_episode
+                if latest is None and episode is None:
                     continue
-                season = _latest_get(latest, "season")
-                episode = _latest_get(latest, "episode")
-                size = _latest_get(latest, "size")
-                has_se = 1 if (season is not None and episode is not None) else 0
-                key = (int(has_se), int(season or 0), int(episode or 0), int(size or 0))
+                key = (
+                    1 if episode is not None else 0,
+                    int(season or 0),
+                    int(episode or 0),
+                    int(size or 0),
+                )
                 if best_key is None or key > best_key:
                     best_key = key
                     best = row
@@ -409,4 +461,28 @@ def repair_banned_drama_tasks(db: Session) -> dict:
         send_runtime(db, DRAMA_NOTIFY_TITLE, content)
     except Exception:
         pass
+    _audit_repair_items(repaired, actor=audit_actor, source=audit_source)
     return {"checked": len(targets), "repaired": len(repaired), "items": repaired}
+
+
+def _audit_repair_items(repaired: list[dict], *, actor: object = None, source: str = audit.SOURCE_AUTO) -> None:
+    """为每个成功修复的任务写一条自动换链审计。"""
+    for item in repaired or []:
+        try:
+            taskname = str(item.get("taskname") or "")
+            drive_type = str(item.get("drive_type") or "").strip()
+            new_url = str(item.get("new_shareurl") or "")
+            suffix = f"（{drive_type}）" if drive_type else ""
+            audit.audit_log_standalone(
+                actor=audit.actor_for_source(actor, source),
+                action="task.shareurl_repair",
+                summary=f"自动修复任务《{taskname}》的失效分享链接{suffix}",
+                target_type="task",
+                target_id=item.get("task_id"),
+                target_name=taskname,
+                source=source,
+                detail=(f"新分享链接：{new_url}" if new_url else None),
+                success=True,
+            )
+        except Exception as e:
+            logger.debug("[audit] task.shareurl_repair 审计写入失败: %s", e)

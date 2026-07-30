@@ -759,9 +759,15 @@ def post_run_task(request: Request, task_id: int, current: CurrentUser = Depends
     task = get_task(db, task_id)
     db.close()
     keep_tree = str(getattr(task, "task_type", "") or "") == "drama"
-    execution = TaskExecutor(db).run_task(task, keep_runtime_tree=keep_tree)
+    execution = TaskExecutor(db).run_task(
+        task,
+        keep_runtime_tree=keep_tree,
+        repair_banned_after=True,
+        audit_actor=current.user,
+        audit_source=audit.SOURCE_MANUAL,
+        audit_ip=request.client.host if request.client else None,
+    )
     with SessionLocal() as adb:
-        audit.write_audit_log(adb, actor_user_id=current.user.id, action='task.run', target_type='task', target_id=str(task_id), ip=request.client.host if request.client else None, user_agent=request.headers.get('user-agent'), success=execution.status == 'success', detail=execution.message)
         if str(getattr(task, "task_type", "") or "") == "drama":
             try:
                 section, should_notify = build_task_section(task, execution)
@@ -823,6 +829,8 @@ def post_run_task(request: Request, task_id: int, current: CurrentUser = Depends
 @router.post('/{task_id:int}/run/stream', dependencies=[Depends(require_permissions_scoped(TASK_RUN))])
 def post_run_task_stream(request: Request, task_id: int, current: CurrentUser = Depends(get_current_user_scoped)):
     actor_user_id = int(getattr(current.user, "id", 0) or 0)
+    actor_username = str(getattr(current.user, "username", "") or "") or None
+    audit_ip = request.client.host if request.client else None
     with SessionLocal() as adb:
         task = get_task(adb, task_id)
         init_payload = {
@@ -830,17 +838,6 @@ def post_run_task_stream(request: Request, task_id: int, current: CurrentUser = 
             "taskname": str(task.taskname),
             "started_at": datetime.now().isoformat(),
         }
-        audit.write_audit_log(
-            adb,
-            actor_user_id=actor_user_id,
-            action='task.run.stream',
-            target_type='task',
-            target_id=str(init_payload["task_id"]),
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get('user-agent'),
-            success=True,
-        )
-        adb.commit()
 
     q: queue.Queue[tuple[str, object]] = queue.Queue()
     done_sentinel = object()
@@ -857,7 +854,15 @@ def post_run_task_stream(request: Request, task_id: int, current: CurrentUser = 
             with SessionLocal() as wdb:
                 wtask = get_task(wdb, task_id)
             keep_tree = str(getattr(wtask, "task_type", "") or "") == "drama"
-            execution = TaskExecutor(db=None).run_task(wtask, log=log, keep_runtime_tree=keep_tree)
+            execution = TaskExecutor(db=None).run_task(
+                wtask,
+                log=log,
+                keep_runtime_tree=keep_tree,
+                repair_banned_after=True,
+                audit_actor=audit.user_actor(actor_user_id, actor_username),
+                audit_source=audit.SOURCE_MANUAL,
+                audit_ip=audit_ip,
+            )
             snapshot_row_id = int(getattr(execution, "_snapshot_row_id", 0) or 0) or None
             if snapshot_row_id and int(getattr(execution, "id", 0) or 0) > 0:
                 try:
@@ -1037,6 +1042,12 @@ def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, cur
                 from app.extensions.runtime.task_executor import TaskExecutor
 
                 task_uid = (str(payload.task_uid or "").strip() or f"preview-{uuid.uuid4().hex}")
+                # 带 task_uid 且已存在的任务：用真实任务行（持久化执行记录），以便失败时写封禁+触发自动修复、
+                # 成功时触发115自动换链；无 task_uid（新建任务试跑）仍走临时任务不落库
+                existing_task_id = 0
+                if str(payload.task_uid or "").strip():
+                    row = wdb.execute(select(Task).where(Task.task_uid == task_uid)).scalars().first()
+                    existing_task_id = int(getattr(row, "id", 0) or 0)
                 wtask = Task(
                     task_uid=task_uid,
                     task_type=str(payload.task_type or "generic"),
@@ -1057,9 +1068,15 @@ def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, cur
                     addition_json=json.dumps(payload.addition or {}, ensure_ascii=False),
                     extra_json=json.dumps(payload.extra or {}, ensure_ascii=False),
                 )
-                wtask.id = 0
+                wtask.id = existing_task_id
                 wdb.close()
-                execution = TaskExecutor(db=None).run_task(wtask, log=log, persist_execution=False)
+                execution = TaskExecutor(db=None).run_task(
+                    wtask,
+                    log=log,
+                    persist_execution=bool(existing_task_id > 0),
+                    repair_banned_after=bool(existing_task_id > 0),
+                    audit_enabled=False,
+                )
                 if str(getattr(wtask, "task_type", "") or "") == "drama":
                     if should_trigger_linked_sync_for_drama_execution(execution):
                         drama_uid = str(getattr(wtask, "task_uid", "") or "").strip()

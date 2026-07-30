@@ -17,13 +17,14 @@ depends_on = None
 
 
 def upgrade() -> None:
+    text_default = None if op.get_bind().dialect.name == "mysql" else ""
     op.create_table(
         "magic_regex_rules",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("key", sa.String(length=64), nullable=False),
         sa.Column("label", sa.String(length=128), nullable=True),
-        sa.Column("pattern", sa.Text(), nullable=False, server_default=""),
-        sa.Column("replace", sa.Text(), nullable=False, server_default=""),
+        sa.Column("pattern", sa.Text(), nullable=False, server_default=text_default),
+        sa.Column("replace", sa.Text(), nullable=False, server_default=text_default),
         sa.Column("enabled", sa.Boolean(), nullable=False, server_default="1"),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),

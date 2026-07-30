@@ -48,6 +48,8 @@ RUN case "$TARGETARCH" in \
     && rm -f /tmp/dl302-linux-amd64 /tmp/dl302-linux-arm64
 
 COPY default /etc/nginx/http.d/default.conf
+COPY migrate-to-mysql.sh /app/migrate-to-mysql.sh
+RUN chmod +x /app/migrate-to-mysql.sh
 
 RUN printf '%s\n' \
     '[unix_http_server]' \
@@ -93,7 +95,7 @@ RUN printf '%s\n' \
     > /etc/supervisord.conf \
     && chmod +x /app/dl302
 
-    ENV TZ="Asia/Shanghai"
+ENV TZ="Asia/Shanghai"
 
 EXPOSE 5115 5225
 CMD ["/usr/bin/supervisord","-c","/etc/supervisord.conf"]

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -17,35 +16,10 @@ from app.models.drive_account import DriveAccount
 from app.schemas.task_browse import SharePreviewBatchIn, SharePreviewBatchItemOut
 from app.services.resource_search import fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
+from app.services.title_match import extract_progress, title_matches_names
 from app.services.tmdb_cache import get_tmdb_detail_cached
 
 logger = logging.getLogger(__name__)
-
-_RE_NON_WORD = re.compile(r"[\s\W_]+", re.UNICODE)
-_RE_SEASON_EPISODE = re.compile(r"\bS(\d{1,3})E(\d{1,4})\b", re.IGNORECASE)
-_RE_EPISODE_ONLY = re.compile(r"\b(?:EP(?:ISODE)?|第)\s*0*(\d{1,4})\s*(?:集)?\b", re.IGNORECASE)
-_RE_YEAR_BRACKETS = re.compile(r"[\(\[（【]\s*(?:19|20)\d{2}\s*[\)\]）】]")
-_RE_SOURCE_PREFIX = re.compile(r"^\s*(?:电视剧|剧集|连续剧|网剧|韩剧|日剧|美剧|英剧|台剧|泰剧|动漫|动画|番剧)\s*[:：]\s*", re.IGNORECASE)
-_RE_NOISE_TOKEN = re.compile(
-    r"\b(?:4k|8k|2160p|1080p|720p|bluray|bdrip|web-?dl|webrip|hdtv|x264|x265|h\.?264|h\.?265|hevc|aac|dts|uhd)\b",
-    re.IGNORECASE,
-)
-_RE_EMOJI = re.compile(
-    r"[\U0001F1E6-\U0001F1FF]"
-    r"|[\U0001F300-\U0001F5FF]"
-    r"|[\U0001F600-\U0001F64F]"
-    r"|[\U0001F680-\U0001F6FF]"
-    r"|[\U0001F700-\U0001F77F]"
-    r"|[\U0001F780-\U0001F7FF]"
-    r"|[\U0001F800-\U0001F8FF]"
-    r"|[\U0001F900-\U0001F9FF]"
-    r"|[\U0001FA00-\U0001FAFF]"
-    r"|[\U00002600-\U000026FF]"
-    r"|[\U00002700-\U000027BF]"
-    r"|[\u200D\uFE0F]",
-    re.UNICODE,
-)
-_TITLE_SEGMENT_SEPARATORS = ("|", "｜", "/", "／")
 
 
 @dataclass(slots=True)
@@ -84,14 +58,6 @@ def _task_extra(task: Any) -> dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def _normalize_text(value: str | None) -> str:
-    return _RE_NON_WORD.sub("", str(value or "").strip()).lower()
-
-
-def _normalize_ascii_words(value: str | None) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -182,14 +148,7 @@ def _rewrite_shareurl_with_fid(shareurl: str, fid: str | None) -> str:
 
 
 def _extract_season_episode_from_title(title: str) -> tuple[int | None, int | None]:
-    text = str(title or "").strip()
-    if not text:
-        return None, None
-    if match := _RE_SEASON_EPISODE.search(text):
-        return int(match.group(1)), int(match.group(2))
-    if match := _RE_EPISODE_ONLY.search(text):
-        return None, int(match.group(1))
-    return None, None
+    return extract_progress(str(title or ""))
 
 
 def _resolve_title_progress(title: str, *, tv_seasons: list[dict[str, Any]] | None = None) -> tuple[int | None, int | None]:
@@ -206,61 +165,8 @@ def _resolve_title_progress(title: str, *, tv_seasons: list[dict[str, Any]] | No
     return season, episode
 
 
-def _cleanup_title_subject(value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    try:
-        import emoji as _emoji  # type: ignore
-
-        text = _emoji.replace_emoji(text, replace=" ")
-    except Exception:
-        text = _RE_EMOJI.sub(" ", text)
-    text = re.sub(r"^[\s\W_]+", "", text)
-    text = _RE_SOURCE_PREFIX.sub("", text)
-    text = re.sub(r"^[\s\W_]+", "", text)
-    text = _RE_YEAR_BRACKETS.sub(" ", text)
-    text = _RE_SEASON_EPISODE.sub(" ", text)
-    text = _RE_EPISODE_ONLY.sub(" ", text)
-    text = _RE_NOISE_TOKEN.sub(" ", text)
-    text = re.sub(r"[\(\[（【].*?[\)\]）】]", " ", text)
-    text = re.sub(r"[:：\-_.,]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _extract_title_subject_variants(value: str) -> list[str]:
-    cleaned = _cleanup_title_subject(value)
-    if not cleaned:
-        return []
-    variants = [cleaned]
-    for separator in _TITLE_SEGMENT_SEPARATORS:
-        if separator not in cleaned:
-            continue
-        parts = [x.strip() for x in cleaned.split(separator) if str(x or "").strip()]
-        variants.extend(parts)
-    return _dedupe_preserve_order(variants)
-
-
 def _title_matches_tmdb_names(title: str, names: list[str]) -> bool:
-    title_variants = _extract_title_subject_variants(title)
-    if not title_variants:
-        return False
-    normalized_title_variants = {_normalize_text(x) for x in title_variants if _normalize_text(x)}
-    normalized_ascii_variants = {_normalize_ascii_words(x) for x in title_variants if _normalize_ascii_words(x)}
-    for raw_name in names:
-        name = str(raw_name or "").strip()
-        if not name:
-            continue
-        name_variants = _extract_title_subject_variants(name) or [name]
-        for item in name_variants:
-            normalized_name = _normalize_text(item)
-            if normalized_name and normalized_name in normalized_title_variants:
-                return True
-            normalized_ascii_name = _normalize_ascii_words(item)
-            if normalized_ascii_name and normalized_ascii_name in normalized_ascii_variants:
-                return True
-    return False
+    return title_matches_names(str(title or ""), names)
 
 
 def _preview_by_shareurl(db: Session, shareurls: list[str]) -> tuple[dict[str, SharePreviewBatchItemOut], bool]:

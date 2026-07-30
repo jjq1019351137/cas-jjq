@@ -16,6 +16,7 @@ from app.db.session import SessionLocal, is_lock_error
 from app.models.drive_account import DriveAccount
 from app.models.task import Task
 from app.services.notifications.sender import send_runtime
+from app.services import audit
 from app.services.notifications.task_notify import DRAMA_NOTIFY_TITLE, build_task_section
 from app.services.task_scheduler import get_or_create_task_scheduler_setting
 from app.services.drama_share_repair import repair_banned_drama_tasks
@@ -286,6 +287,7 @@ def run_drama_tasks() -> None:
                     defer_plugins=False,
                     allow_drama_plugins=True,
                     keep_runtime_tree=True,
+                    audit_source=audit.SOURCE_SCHEDULER,
                 )
                 try:
                     auto_update_lines = _extract_execution_log_section_lines(

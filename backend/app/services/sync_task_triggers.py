@@ -13,6 +13,7 @@ from app.extensions.runtime.execution_log import ExecutionLog
 from app.models.sync_execution import SyncExecution
 from app.models.sync_task import SyncTask
 from app.models.sync_task_drama_link import SyncTaskDramaLink
+from app.services import audit
 
 
 logger = logging.getLogger(__name__)
@@ -173,7 +174,13 @@ def run_linked_sync_tasks_blocking(
         if force_refresh_suppressed:
             log.line(f"联动覆盖: {sync_task_name} force_refresh=false")
         try:
-            execution = SyncExecutor(db=None).run_sync_task(row, log=log, strategy_override=strategy_override)
+            execution = SyncExecutor(db=None).run_sync_task(
+                row,
+                log=log,
+                strategy_override=strategy_override,
+                audit_actor=audit.LINKED_ACTOR,
+                audit_source=audit.SOURCE_LINKED,
+            )
             execution_id = int(getattr(execution, "id", 0) or 0) or None
             status = str(getattr(execution, "status", "") or "").strip() or "unknown"
             message = str(getattr(execution, "message", "") or "").strip()
@@ -291,7 +298,11 @@ def _run_linked_sync_tasks(task_uids: list[str], source: str) -> None:
                     skipped += 1
                     continue
                 try:
-                    execution = SyncExecutor(db=None).run_sync_task(task)
+                    execution = SyncExecutor(db=None).run_sync_task(
+                        task,
+                        audit_actor=audit.LINKED_ACTOR,
+                        audit_source=audit.SOURCE_LINKED,
+                    )
                     success += 1
                 except Exception as e:
                     failed += 1
@@ -360,7 +371,11 @@ def _run_sync_tasks_by_uids(sync_uids: list[str], source: str) -> None:
                 if task is None:
                     continue
                 try:
-                    execution = SyncExecutor(db=None).run_sync_task(task)
+                    execution = SyncExecutor(db=None).run_sync_task(
+                        task,
+                        audit_actor=audit.LINKED_ACTOR,
+                        audit_source=audit.SOURCE_LINKED,
+                    )
                     logger.info(
                         "同步任务执行完成 uid=%s status=%s",
                         task_uid,

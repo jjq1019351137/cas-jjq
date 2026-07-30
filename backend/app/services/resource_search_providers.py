@@ -15,11 +15,14 @@ import requests
 EXTERNAL_TIMEOUT = (15, 200)
 logger = logging.getLogger(__name__)
 
+
 SUPPORTED_CLOUD_TYPES = {
     "quark",
     "pan123",
+    "123",
     "pan115",
     "cloud115",
+    "115",
     "uc",
     "tianyi",
     "cloud189",
@@ -27,6 +30,9 @@ SUPPORTED_CLOUD_TYPES = {
     "xunlei",
     "baidupan",
     "baidu",
+    "yidong",
+    "mobile",
+    "guangya",
 }
 
 
@@ -57,11 +63,12 @@ def _pansou_cloud_type(value: str | None) -> str | None:
     dt = _normalize_drive_type(value)
     if not dt:
         return None
+
     mapping = {
         "115": "115",
-        "123pan": "pan123",
+        "123pan": "123",
         "cloud189": "tianyi",
-        "baidu": "baiduPan",
+        "baidu": "baidu",
         "quark": "quark",
         "uc": "uc",
         "aliyun": "aliyun",
@@ -74,10 +81,9 @@ def _pansou_cloud_type(value: str | None) -> str | None:
 
 _PANSOU_MERGED_KEY_ALIASES = {
     "tianyi": ("tianyi", "cloud189"),
-    "pan115": ("pan115", "cloud115", "115"),
     "115": ("115", "pan115", "cloud115"),
-    "pan123": ("pan123", "123pan"),
-    "baiduPan": ("baiduPan", "baidupan", "baidu"),
+    "123": ("123", "pan123", "123pan"),
+    "baidu": ("baidu", "baiduPan", "baidupan"),
     "mobile": ("mobile", "cloud139"),
 }
 
@@ -101,7 +107,7 @@ def _pansou_merged_keys(cloud_type: str) -> list[str]:
 
 
 # PanSou 默认覆盖的云盘类型（未指定网盘类型时使用）
-DEFAULT_PANSOU_CLOUD_TYPES = ("quark", "pan123", "pan115", "uc", "tianyi", "aliyun", "xunlei", "baiduPan")
+DEFAULT_PANSOU_CLOUD_TYPES = ("quark", "123", "115", "uc", "tianyi", "aliyun", "xunlei", "baidu", "mobile")
 
 
 def _debug_enabled() -> bool:

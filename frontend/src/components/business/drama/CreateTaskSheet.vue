@@ -128,6 +128,8 @@ const isInitializing = ref(false)
 
 // Resource search dialog state
 const showResourceSearch = ref(false)
+const resourceSearchOpening = ref(false)
+const resourceSearchQuery = ref('')
 
 // Plugin expand state
 const expandedPlugins = ref(new Set<string>())
@@ -237,9 +239,20 @@ watch(
       state.auto_update_115_shareurl = Boolean(task.extra?.auto_update_115_shareurl ?? true)
       state.update_subdir_resave_mode = String(task.extra?.update_subdir_resave_mode || 'none') as any
       const extra = task.extra || {}
-      state.runweek_mode = String((extra as any).runweek_mode || 'manual') === 'auto' ? 'auto' : 'manual'
       const rw = Array.isArray((extra as any).runweek) ? (extra as any).runweek : []
       state.runweek = rw.map((x: any) => Number(x)).filter((x: number) => x >= 1 && x <= 7)
+      const savedMode = String((extra as any).runweek_mode || '').trim().toLowerCase()
+      if (savedMode === 'auto' || savedMode === 'manual') {
+        state.runweek_mode = savedMode
+      } else if (task.tmdb_id && String(task.tmdb_media_type || '').toLowerCase() === 'tv' && !state.runweek.length) {
+        // 历史任务：已关联 TMDB 剧集且未手动配置过更新日，默认自动模式
+        state.runweek_mode = 'auto'
+        nextTick(() => {
+          applyAutoRunweekFromTmdb(Number(task.tmdb_id) || 0, 'tv').catch(() => {})
+        })
+      } else {
+        state.runweek_mode = 'manual'
+      }
       const taskUid = String(task.task_uid || '').trim()
       // Use the ordered sync_task_uids from the task response (backend returns them sorted by sort_order)
       const savedSyncUids = Array.isArray(task.sync_task_uids) ? task.sync_task_uids.map((u: any) => String(u || '').trim()).filter(Boolean) : []
@@ -383,6 +396,8 @@ function isCloud139HashShareurl(shareurl: string) {
 function getShareurl(shareurl: string, dir?: { fid?: string; name?: string }) {
   const raw = String(shareurl || '').trim()
   const fid = String(dir?.fid || '').trim()
+  // 路径型 fid（如百度网盘的 '/'、'/我的资源'）无法嵌入 URL 定位，直接返回原链接，避免正则拼接把链接截断成裸域名
+  if (fid.includes('/')) return raw
   if (isCloud139HashShareurl(raw)) {
     const [head, fragment = ''] = raw.split('#', 2)
     if (fragment) {
@@ -402,7 +417,8 @@ function getShareurl(shareurl: string, dir?: { fid?: string; name?: string }) {
     return (match ? match[0] : raw.split('#')[0]).trim()
   }
   if (raw.includes(fid)) {
-    const m = raw.match(new RegExp(`.*/${fid}[^/]*`))
+    const escapedFid = fid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const m = raw.match(new RegExp(`.*/${escapedFid}[^/]*`))
     if (m?.[0]) return m[0]
   }
   if (raw.includes('#/list/share')) {
@@ -513,8 +529,10 @@ async function getTmdbDetailForCurrent() {
   if (tmdbDetailCache.value[key]) return tmdbDetailCache.value[key]
   try {
     const detail = await fetchTMDBDetail(mt as any, id)
-    tmdbDetailCache.value[key] = detail
-    return detail
+    // 后端返回 {media_type, data:{...}} 包裹结构，解包后供调用方直接取 name/genres 等字段
+    const flat = (detail as any)?.data && typeof (detail as any).data === 'object' ? (detail as any).data : detail
+    tmdbDetailCache.value[key] = flat
+    return flat
   } catch {
     tmdbDetailCache.value[key] = null
     return null
@@ -613,7 +631,8 @@ watch(() => state.shareurl, (newUrl, oldUrl) => {
       const row = (batchRes.items || []).find(x => String(x.shareurl || '').trim() === url)
       if (row && row.ok) {
         const fid = String((row as any).pdir_fid || (row as any).resolved_pdir_fid || '').trim()
-        if (fid && fid !== '0' && fid !== 'root') {
+        // 排除根目录与路径型 fid（如百度的 '/'）：无需/无法重写链接，保持用户输入不变
+        if (fid && fid !== '0' && fid !== 'root' && !fid.includes('/')) {
           // Auto deep-in: rewrite shareurl with resolved pdir_fid
           const resolved = getShareurl(url, { fid })
           if (resolved !== url) {
@@ -1080,12 +1099,16 @@ function handleRunOnce() {
     toast.error('请填写保存路径')
     return
   }
-  const payload = buildPayload()
+  const payload: Record<string, any> = buildPayload()
   payload.extra = {
     ...(payload.extra || {}),
     allow_once: true,
     runweek: [],
   }
+  // 编辑已存在任务时带上 task_uid，后端据此关联真实任务：
+  // 失败时才能写入 shareurl_ban 并触发自动修复，成功时才能触发115自动换链
+  const editingUid = String(props.editTask?.task_uid || '').trim()
+  if (editingUid) payload.task_uid = editingUid
   emit('run-once', payload)
 }
 
@@ -1122,7 +1145,21 @@ const resourceSearchDriveTypes = computed(() => {
 })
 
 function openResourceSearch() {
-  showResourceSearch.value = true
+  if (resourceSearchOpening.value) return
+  resourceSearchOpening.value = true
+  ;(async () => {
+    let q = String(state.taskname || '').trim()
+    // 已关联 TMDB 时优先用 TMDB 标题作为搜索词（任务名可能带季/画质等噪声）
+    if (Number(state.tmdb_id) > 0) {
+      const detail = await getTmdbDetailForCurrent()
+      const title = String(detail?.name || detail?.title || '').trim()
+      if (title) q = title
+    }
+    resourceSearchQuery.value = q
+    showResourceSearch.value = true
+  })().finally(() => {
+    resourceSearchOpening.value = false
+  })
 }
 
 function onResourceSelected(item: TaskSuggestionItem) {
@@ -1381,8 +1418,10 @@ function getTmdbPoster(item: TMDBBrief): string {
                   <Button
                     size="sm" variant="ghost"
                     class="absolute right-1 top-1/2 -translate-y-1/2 h-7 text-xs"
+                    :disabled="resourceSearchOpening"
                     @click="openResourceSearch">
-                    <Search class="h-3 w-3 mr-1" />
+                    <Loader2 v-if="resourceSearchOpening" class="h-3 w-3 mr-1 animate-spin" />
+                    <Search v-else class="h-3 w-3 mr-1" />
                     搜索资源
                   </Button>
                 </div>
@@ -1795,7 +1834,7 @@ function getTmdbPoster(item: TMDBBrief): string {
     <!-- 资源搜索弹窗 -->
     <ResourceSearchDialog
       v-model:visible="showResourceSearch"
-      :initial-query="state.taskname || ''"
+      :initial-query="resourceSearchQuery"
       :drive-type="resourceSearchDriveType"
       :drive-types="resourceSearchDriveTypes"
       @select="onResourceSelected"

@@ -36,11 +36,26 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _ensure_wide_version_table(connection) -> None:
+    if connection.dialect.name != "mysql":
+        return
+    connection.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS alembic_version ("
+        "version_num VARCHAR(255) NOT NULL, "
+        "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+    )
+    connection.exec_driver_sql(
+        "ALTER TABLE alembic_version MODIFY version_num VARCHAR(255) NOT NULL"
+    )
+    connection.commit()
+
+
 def run_migrations_online() -> None:
     runtime = build_runtime(for_migrations=True)
     connectable = runtime.engine
 
     with connectable.connect() as connection:
+        _ensure_wide_version_table(connection)
         context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
 
         with context.begin_transaction():

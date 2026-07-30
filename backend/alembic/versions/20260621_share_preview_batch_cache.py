@@ -25,7 +25,7 @@ def upgrade() -> None:
 
     op.create_table(
         "share_preview_batch_cache",
-        sa.Column("shareurl", sa.String(length=2048), primary_key=True, nullable=False),
+        sa.Column("shareurl", sa.String(length=2048).with_variant(sa.String(length=768), "mysql"), primary_key=True, nullable=False),
         sa.Column("drive_type", sa.String(length=32), nullable=True),
         sa.Column("ok", sa.Boolean(), nullable=False, server_default="0"),
         sa.Column("message", sa.Text(), nullable=True),

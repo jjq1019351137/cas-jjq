@@ -76,6 +76,7 @@ from app.services.sync_tasks import (
     validate_netdisk_sync_account,
 )
 from app.extensions.runtime.sync_executor import SyncExecutor
+from app.services import audit
 from app.services.task_scheduler import get_or_create_task_scheduler_setting, update_task_scheduler_setting
 from app.services.tasks import (
     create_task,
@@ -580,7 +581,12 @@ class TelegramBotActions:
     def run_task(self, task_id: int) -> dict[str, Any]:
         task = get_task(self.db, int(task_id))
         self.db.close()
-        execution = TaskExecutor(self.db).run_task(task)
+        execution = TaskExecutor(self.db).run_task(
+            task,
+            repair_banned_after=True,
+            audit_actor=audit.SystemActor("Telegram 机器人"),
+            audit_source=audit.SOURCE_MANUAL,
+        )
         return _task_execution_summary(execution) or {}
 
     def list_task_executions(self, task_id: int, *, limit: int = 5) -> list[dict[str, Any]]:
@@ -958,7 +964,11 @@ class TelegramBotActions:
     def run_sync_task(self, sync_task_id: int) -> dict[str, Any]:
         task = get_sync_task(self.db, int(sync_task_id))
         self.db.close()
-        execution = SyncExecutor(self.db).run_sync_task(task)
+        execution = SyncExecutor(self.db).run_sync_task(
+            task,
+            audit_actor=audit.SystemActor("Telegram 机器人"),
+            audit_source=audit.SOURCE_MANUAL,
+        )
         return _sync_execution_summary(execution) or {}
 
     def cancel_sync_task(self, sync_task_id: int) -> dict[str, Any] | None:

@@ -7,7 +7,7 @@ import { Search, Loader2, X, History, Trash2, CheckCircle2, XCircle, HelpCircle 
 import { previewShare } from '@/api/tasks'
 import { fetchTaskSuggestions, verifyTaskSuggestions } from '@/api/resourceSearch'
 import { RESOURCE_SEARCH_SOURCE_LABELS, type TaskSuggestionItem } from '@/types/resourceSearch'
-import { detectDriveTypeByUrl } from '@/utils/driveType'
+import { detectDriveTypeByUrl, getDriveTypeLabel } from '@/utils/driveType'
 
 interface Props {
   visible: boolean
@@ -48,8 +48,22 @@ const search = reactive({
 })
 
 const selectedSource = ref<string>('all')
+const selectedDrive = ref<string>('all')
 const visibleCount = ref(PAGE_SIZE)
 const history = ref<string[]>(loadHistory())
+
+// 按分享链接缓存网盘类型，避免 computed 中重复正则探测
+const driveTypeCache = new Map<string, string>()
+function itemDriveType(item: TaskSuggestionItem): string {
+  const url = String(item.shareurl || '')
+  if (!url) return 'unknown'
+  let dt = driveTypeCache.get(url)
+  if (dt === undefined) {
+    dt = String(detectDriveTypeByUrl(url) || 'unknown')
+    driveTypeCache.set(url, dt)
+  }
+  return dt
+}
 
 // ===== History =====
 function loadHistory(): string[] {
@@ -80,9 +94,21 @@ function clearHistory() {
 }
 
 // ===== Derived =====
+// 渠道/网盘两个维度叠加筛选；各自的计数基于另一维度筛选后的结果
+function matchSource(item: TaskSuggestionItem) {
+  if (selectedSource.value === 'all') return true
+  return (String(item.source_key || item.source || '').trim() || 'unknown') === selectedSource.value
+}
+
+function matchDrive(item: TaskSuggestionItem) {
+  if (selectedDrive.value === 'all') return true
+  return itemDriveType(item) === selectedDrive.value
+}
+
 const sourceOptions = computed(() => {
   const map = new Map<string, { key: string; label: string; count: number }>()
   for (const item of search.items) {
+    if (!matchDrive(item)) continue
     const key = String(item.source_key || item.source || '').trim() || 'unknown'
     const label = RESOURCE_SEARCH_SOURCE_LABELS[key] || String(item.source || key)
     const entry = map.get(key) || { key, label, count: 0 }
@@ -92,10 +118,22 @@ const sourceOptions = computed(() => {
   return [...map.values()]
 })
 
-const filteredItems = computed(() => {
-  if (selectedSource.value === 'all') return search.items
-  return search.items.filter((x) => (String(x.source_key || x.source || '').trim() || 'unknown') === selectedSource.value)
+const driveOptions = computed(() => {
+  const map = new Map<string, { key: string; label: string; count: number }>()
+  for (const item of search.items) {
+    if (!matchSource(item)) continue
+    const key = itemDriveType(item)
+    const entry = map.get(key) || { key, label: getDriveTypeLabel(key), count: 0 }
+    entry.count += 1
+    map.set(key, entry)
+  }
+  return [...map.values()].sort((a, b) => b.count - a.count)
 })
+
+const filteredItems = computed(() => search.items.filter((x) => matchSource(x) && matchDrive(x)))
+
+const sourceAllCount = computed(() => search.items.filter(matchDrive).length)
+const driveAllCount = computed(() => search.items.filter(matchSource).length)
 
 const displayItems = computed(() => filteredItems.value.slice(0, visibleCount.value))
 
@@ -145,6 +183,7 @@ async function doSearch(deep: 0 | 1) {
   search.message = ''
   search.items = []
   selectedSource.value = 'all'
+  selectedDrive.value = 'all'
   visibleCount.value = PAGE_SIZE
   search.runId += 1
   const runId = search.runId
@@ -266,7 +305,7 @@ function applyHistory(q: string) {
   doSearch(0)
 }
 
-watch(selectedSource, () => {
+watch([selectedSource, selectedDrive], () => {
   visibleCount.value = PAGE_SIZE
   if (listRef.value) listRef.value.scrollTop = 0
 })
@@ -280,6 +319,7 @@ watch(
       search.message = ''
       search.searched = false
       selectedSource.value = 'all'
+      selectedDrive.value = 'all'
       visibleCount.value = PAGE_SIZE
       history.value = loadHistory()
       nextTick(() => {
@@ -361,34 +401,60 @@ watch(
             </button>
           </div>
 
-          <!-- Source filter + stats -->
-          <div v-if="search.items.length" class="mt-2.5 flex flex-wrap items-center justify-between gap-2">
+          <!-- Source / drive filters + stats -->
+          <div v-if="search.items.length" class="mt-2.5 space-y-1.5">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span class="text-[10px] text-[hsl(var(--muted-foreground))]">渠道</span>
+                <button
+                  class="rounded-full px-2.5 py-0.5 text-xs transition-colors"
+                  :class="selectedSource === 'all'
+                    ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
+                    : 'border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]'"
+                  @click="selectedSource = 'all'"
+                >
+                  全部 ({{ sourceAllCount }})
+                </button>
+                <button
+                  v-for="opt in sourceOptions"
+                  :key="opt.key"
+                  class="rounded-full px-2.5 py-0.5 text-xs transition-colors"
+                  :class="selectedSource === opt.key
+                    ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
+                    : 'border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]'"
+                  @click="selectedSource = opt.key"
+                >
+                  {{ opt.label }} ({{ opt.count }})
+                </button>
+              </div>
+              <div class="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+                <span class="inline-flex items-center gap-0.5"><CheckCircle2 class="h-3 w-3 text-green-500" /> {{ stats.valid }}</span>
+                <span class="inline-flex items-center gap-0.5"><XCircle class="h-3 w-3 text-red-400" /> {{ stats.invalid }}</span>
+                <span v-if="stats.pending" class="inline-flex items-center gap-0.5"><HelpCircle class="h-3 w-3" /> {{ stats.pending }}</span>
+              </div>
+            </div>
             <div class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[10px] text-[hsl(var(--muted-foreground))]">网盘</span>
               <button
                 class="rounded-full px-2.5 py-0.5 text-xs transition-colors"
-                :class="selectedSource === 'all'
+                :class="selectedDrive === 'all'
                   ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
                   : 'border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]'"
-                @click="selectedSource = 'all'"
+                @click="selectedDrive = 'all'"
               >
-                全部 ({{ search.items.length }})
+                全部 ({{ driveAllCount }})
               </button>
               <button
-                v-for="opt in sourceOptions"
+                v-for="opt in driveOptions"
                 :key="opt.key"
                 class="rounded-full px-2.5 py-0.5 text-xs transition-colors"
-                :class="selectedSource === opt.key
+                :class="selectedDrive === opt.key
                   ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
                   : 'border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]'"
-                @click="selectedSource = opt.key"
+                @click="selectedDrive = opt.key"
               >
                 {{ opt.label }} ({{ opt.count }})
               </button>
-            </div>
-            <div class="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
-              <span class="inline-flex items-center gap-0.5"><CheckCircle2 class="h-3 w-3 text-green-500" /> {{ stats.valid }}</span>
-              <span class="inline-flex items-center gap-0.5"><XCircle class="h-3 w-3 text-red-400" /> {{ stats.invalid }}</span>
-              <span v-if="stats.pending" class="inline-flex items-center gap-0.5"><HelpCircle class="h-3 w-3" /> {{ stats.pending }}</span>
             </div>
           </div>
         </div>
@@ -409,7 +475,7 @@ watch(
           <!-- Empty -->
           <div v-else-if="search.searched && !filteredItems.length" class="flex flex-col items-center justify-center gap-1.5 py-16 text-sm text-[hsl(var(--muted-foreground))]">
             <Search class="h-8 w-8 opacity-40" />
-            <span>{{ search.items.length ? '当前渠道下没有结果，试试其他渠道' : '未搜索到资源，试试深度搜索或换个关键词' }}</span>
+            <span>{{ search.items.length ? '当前筛选条件下没有结果，试试其他渠道或网盘' : '未搜索到资源，试试深度搜索或换个关键词' }}</span>
           </div>
 
           <!-- Idle -->
@@ -447,7 +513,8 @@ watch(
                 class="mt-0.5 block truncate text-xs text-[hsl(var(--primary))] hover:underline"
                 @click.stop
               >{{ item.shareurl }}</a>
-              <div v-if="item.content || item.datetime || item.channel" class="mt-0.5 flex items-center gap-2 overflow-hidden">
+              <div v-if="item.content || item.datetime || item.channel || item.shareurl" class="mt-0.5 flex items-center gap-2 overflow-hidden">
+                <span class="shrink-0 text-[10px] text-[hsl(var(--muted-foreground))]">{{ getDriveTypeLabel(itemDriveType(item)) }}</span>
                 <span v-if="item.datetime" class="shrink-0 text-[10px] text-[hsl(var(--muted-foreground))]">{{ item.datetime }}</span>
                 <span v-if="item.channel" class="shrink-0 text-[10px] text-[hsl(var(--muted-foreground))]">{{ item.channel }}</span>
                 <span v-if="item.content" class="truncate text-[10px] text-[hsl(var(--muted-foreground))]">{{ item.content }}</span>

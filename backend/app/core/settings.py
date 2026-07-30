@@ -85,10 +85,15 @@ class Settings(BaseSettings):
 
     db_host: str = "127.0.0.1"
     db_port: int = 3306
-    db_name: str = "xxm"
+    db_name: str = "casx"
     db_user: str = "root"
     db_password: str = ""
     db_charset: str = "utf8mb4"
+
+    db_connect_timeout_seconds: int = 10
+    db_pool_size: int = 10
+    db_pool_max_overflow: int = 20
+    db_pool_recycle_seconds: int = 3600
 
     tasks_share_preview_batch_cache_ttl_seconds: int = 300
     tasks_share_preview_batch_cache_max_entries: int = 2000
@@ -133,7 +138,7 @@ class Settings(BaseSettings):
             password = quote_plus(str(self.db_password or ""))
             auth = user if not password else f"{user}:{password}"
             host = str(self.db_host or "127.0.0.1").strip() or "127.0.0.1"
-            name = str(self.db_name or "xxm").strip() or "xxm"
+            name = str(self.db_name or "casx").strip() or "casx"
             charset = str(self.db_charset or "utf8mb4").strip() or "utf8mb4"
             return f"mysql+pymysql://{auth}@{host}:{int(self.db_port or 3306)}/{name}?charset={charset}"
 

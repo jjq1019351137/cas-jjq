@@ -161,7 +161,7 @@ services:
 | `APP_DATA_DIR`   | `./data`   | 项目运行数据目录，缓存等文件会落在这里 |
 | `DB_HOST`        | `127.0.0.1`| MySQL 主机地址，仅 `DB_DRIVER=mysql` 时生效 |
 | `DB_PORT`        | `3306`     | MySQL 端口，仅 `DB_DRIVER=mysql` 时生效 |
-| `DB_NAME`        | `xxm`      | MySQL 数据库名，仅 `DB_DRIVER=mysql` 时生效 |
+| `DB_NAME`        | `casx`      | MySQL 数据库名，仅 `DB_DRIVER=mysql` 时生效 |
 | `DB_USER`        | `root`     | MySQL 用户名，仅 `DB_DRIVER=mysql` 时生效 |
 | `DB_PASSWORD`    | 空         | MySQL 密码，仅 `DB_DRIVER=mysql` 时生效 |
 | `DB_CHARSET`     | `utf8mb4`  | MySQL 字符集，仅 `DB_DRIVER=mysql` 时生效 |
@@ -185,7 +185,7 @@ services:
 
 ```env
 DB_DRIVER=mysql
-DATABASE_URL=mysql+pymysql://root:your_password@127.0.0.1:3306/xxm?charset=utf8mb4
+DATABASE_URL=mysql+pymysql://root:your_password@127.0.0.1:3306/casx?charset=utf8mb4
 APP_DATA_DIR=./data
 ```
 
@@ -195,7 +195,7 @@ APP_DATA_DIR=./data
 DB_DRIVER=mysql
 DB_HOST=127.0.0.1
 DB_PORT=3306
-DB_NAME=xxm
+DB_NAME=casx
 DB_USER=root
 DB_PASSWORD=your_password
 DB_CHARSET=utf8mb4
@@ -206,7 +206,7 @@ APP_DATA_DIR=./data
 
 - `DATABASE_URL` 优先级最高，配置后会覆盖 `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD`
 - `APP_DATA_DIR` 是项目运行数据目录，不是 MySQL 数据文件目录
-- 首次切换到 MySQL 前请先手动创建数据库，例如 `CREATE DATABASE xxm CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
+- 首次切换到 MySQL 前请先手动创建数据库，例如 `CREATE DATABASE casx CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
 - 配置完成后请执行数据库迁移，再启动服务
 
 如果使用 `docker-compose`，可以这样写：
@@ -226,7 +226,7 @@ services:
       DB_DRIVER: mysql
       DB_HOST: 127.0.0.1
       DB_PORT: 3306
-      DB_NAME: xxm
+      DB_NAME: casx
       DB_USER: root
       DB_PASSWORD: your_password
       DB_CHARSET: utf8mb4

@@ -142,6 +142,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         self._bdstoken: str = ""
         self._user_id: Optional[int] = None
         self._share_info: Dict[str, Dict] = {}  # 缓存分享信息
+        self._share_session: Optional[requests.Session] = None  # 分享操作专用独立 session
 
         # 解析 cookie 并创建 session
         if cookie:
@@ -163,6 +164,13 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         """初始化 requests session"""
         self._session = requests.Session()
         self._session.cookies.update(self._cookies_dict)
+
+    def _get_share_session(self) -> requests.Session:
+        if self._share_session is None:
+            s = requests.Session()
+            s.cookies.update(self._cookies_dict)
+            self._share_session = s
+        return self._share_session
 
     def _get_error_message(self, errno: int) -> str:
         """获取错误码对应的提示信息"""
@@ -187,10 +195,12 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         params: Optional[Dict[str, str]] = None,
         headers: Optional[Dict[str, str]] = None,
         data: Any = None,
+        session: Optional[requests.Session] = None,
         **kwargs,
     ) -> requests.Response:
-        """发送 HTTP 请求"""
-        if not self._session:
+        """发送 HTTP 请求（session 为空时默认用账号主 session，分享操作可传入独立 session）"""
+        sess = session if session is not None else self._session
+        if sess is None:
             raise Exception("Session 未初始化，请检查 Cookie")
         self._throttle_request()
         if params is None:
@@ -202,7 +212,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             headers = self._get_headers(url)
 
         try:
-            resp = self._session.request(
+            resp = sess.request(
                 method,
                 url,
                 params=params,
@@ -212,6 +222,24 @@ class BaiduAdapter(BaseCloudDriveAdapter):
                 **kwargs,
             )
             return resp
+        except requests.exceptions.ContentDecodingError as e:
+            logger.warning(f"[Baidu] 响应解压失败，改用 identity 编码重试: {e}")
+            retry_headers = dict(headers)
+            retry_headers["Accept-Encoding"] = "identity"
+            try:
+                resp = sess.request(
+                    method,
+                    url,
+                    params=params,
+                    headers=retry_headers,
+                    data=data,
+                    timeout=30,
+                    **kwargs,
+                )
+                return resp
+            except Exception as e2:
+                logger.error(f"[Baidu] HTTP 请求失败: {e2}")
+                raise
         except Exception as e:
             logger.error(f"[Baidu] HTTP 请求失败: {e}")
             raise
@@ -223,6 +251,21 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             error_msg = info.get("errmsg") or info.get("error_msg") or self._get_error_message(errno)
             logger.error(f"[Baidu] API 错误: errno={errno}, msg={error_msg}")
         return info
+
+    def _set_bdclnd_from_randsk(self, randsk: str) -> None:
+        if not randsk:
+            return
+        try:
+            sess = self._get_share_session()
+            for c in list(sess.cookies):
+                if c.name == "BDCLND":
+                    try:
+                        sess.cookies.clear(c.domain, c.path, c.name)
+                    except Exception:
+                        pass
+            sess.cookies.set("BDCLND", randsk, domain=".baidu.com", path="/")
+        except Exception as e:
+            logger.debug(f"[Baidu] 设置 BDCLND 失败: {e}")
 
     # ==================== 获取 bdstoken ====================
     def _get_bdstoken(self) -> str:
@@ -586,6 +629,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             "web": "1",
             "bdstoken": "null",
             "clienttype": "0",
+            "app_id": "250528",
         }
         data = {
             "pwd": password,
@@ -594,34 +638,37 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         }
 
         headers = dict(PAN_HEADERS)
-        headers["Referer"] = init_url
-
-        resp = self._request("POST", url, params=params, headers=headers, data=data)
-
-        # 更新 cookies
-        self._session.cookies.update(resp.cookies.get_dict())
-
-        return self._check_response(resp.json())
+        headers["Referer"] = init_url + "&pwd=" + password
+        surl = params["surl"]
+        
+        resp = self._request("POST", url, params=params, headers=headers, data=data, session=self._get_share_session())
+        info = self._check_response(resp.json())
+        errno = info.get("errno") or info.get("error_code") or 0
+        if errno:
+            logger.error("[Baidu][share/verify] 失败 surl=%s errno=%s msg=%s", surl, errno, self._get_error_message(errno))
+            if errno in (-1, -9, -7, 4, 105, 145, 200025):
+                raise Exception(f"errno={errno}, msg={self._get_error_message(errno)}")
+        else:
+            self._set_bdclnd_from_randsk(info.get("randsk") or "")
+        return info
 
     def _api_shared_paths(self, shared_url: str) -> Dict:
         """获取分享文件列表（从 HTML 解析）"""
-        resp = self._request("GET", shared_url, params=None)
+        logger.info("[Baidu][share/page] 请求分享页面 url=%s", shared_url)
+        # 分享页面访问走独立 session（带已验证的 BDCLND）
+        resp = self._request("GET", shared_url, params=None, session=self._get_share_session())
         html = resp.text
 
-        # 更新 cookies
-        self._session.cookies.update(resp.cookies.get_dict())
-
-        # 解析 yunData.setData 或 locals.mset
         match = re.search(r"(?:yunData\.setData|locals\.mset)\((.+?)\);", html)
         if not match:
-            logger.error("[Baidu] 无法解析分享页面数据")
+            logger.error("[Baidu][share/page] 无法解析分享页面数据 url=%s html_len=%s", shared_url, len(html or ""))
             return {}
 
         try:
             shared_data = json.loads(match.group(1))
             return shared_data
         except json.JSONDecodeError as e:
-            logger.error(f"[Baidu] 解析分享数据 JSON 失败: {e}")
+            logger.error(f"[Baidu][share/page] 解析分享数据 JSON 失败: {e}")
             return {}
 
     def _api_list_shared_paths(
@@ -649,8 +696,14 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             "bdstoken": "null",
             "showempty": "0",
         }
-        resp = self._request("GET", url, params=params)
-        return self._check_response(resp.json())
+
+        resp = self._request("GET", url, params=params, session=self._get_share_session())
+        info = self._check_response(resp.json())
+        errno = info.get("errno") or info.get("error_code") or 0
+        if errno:
+            logger.error("[Baidu][share/list] 失败 dir=%s errno=%s msg=%s", sharedpath, errno, self._get_error_message(errno))
+
+        return info
 
     def _api_transfer_shared_paths(
         self,
@@ -663,9 +716,18 @@ class BaiduAdapter(BaseCloudDriveAdapter):
     ) -> Dict:
         """转存分享文件"""
         url = PanNode.url(PanNode.TRANSFER_SHARED)
+
+        sekey = ""
+        for c in self._get_share_session().cookies:
+            if c.name == "BDCLND" and c.value:
+                sekey = unquote(c.value)
+                break
         params = {
             "shareid": str(share_id),
             "from": str(uk),
+            "sekey": sekey,
+            "ondup": "newcopy",
+            "async": "1",
             "bdstoken": bdstoken,
             "channel": "chunlei",
             "clienttype": "0",
@@ -682,12 +744,16 @@ class BaiduAdapter(BaseCloudDriveAdapter):
         headers["Origin"] = "https://pan.baidu.com"
         headers["Referer"] = shared_url
 
-        resp = self._request("POST", url, params=params, headers=headers, data=data)
+        resp = self._request("POST", url, params=params, headers=headers, data=data, session=self._get_share_session())
         info = resp.json()
 
         # 处理嵌套错误码
         if info.get("info") and info["info"][0].get("errno"):
             info["errno"] = info["info"][0]["errno"]
+
+        errno = info.get("errno") or info.get("error_code") or 0
+        if errno:
+            logger.error("[Baidu][share/transfer] 失败 dest=%s errno=%s msg=%s", remotedir, errno, self._get_error_message(errno))
 
         return self._check_response(info)
 
@@ -858,6 +924,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
 
         try:
             share_url = f"https://pan.baidu.com/s/{pwd_id}"
+            
             self._api_access_shared(share_url, passcode)
             return {
                 "status": 200,
@@ -900,17 +967,14 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             passcode = parts[1] if len(parts) > 1 else ""
 
             share_url = f"https://pan.baidu.com/s/{share_id}"
+            
             self._api_access_shared(share_url, passcode)
 
             # 获取分享数据
             shared_data = self._api_shared_paths(share_url)
             if not shared_data:
-                return {
-                    "code": 0,
-                    "message": "success",
-                    "data": {"list": [], "full_path": []},
-                    "metadata": {"_total": 0},
-                }
+                # 页面解析失败不能伪装成"空分享"，否则任务会误判为无文件而静默跳过
+                return {"code": 1, "message": "无法解析分享页面数据，分享可能已失效", "data": {"list": []}}
 
             uk = shared_data.get("share_uk") or shared_data.get("uk")
             if uk:
@@ -1073,6 +1137,7 @@ class BaiduAdapter(BaseCloudDriveAdapter):
             passcode = parts[1] if len(parts) > 1 else ""
 
             share_url = f"https://pan.baidu.com/s/{share_id}"
+
             remote_dir = self._resolve_fid_to_path(to_pdir_fid if to_pdir_fid else "0")
 
             # --- 记录转存前目标目录的文件列表 ---

@@ -26,7 +26,7 @@ def upgrade() -> None:
             sa.Column("id", sa.Integer(), primary_key=True),
             sa.Column("key", sa.String(length=32), nullable=False),
             sa.Column("enabled", sa.Boolean(), nullable=False, server_default="1"),
-            sa.Column("config_json", sa.Text(), nullable=False, server_default=""),
+            sa.Column("config_json", sa.Text(), nullable=False, server_default=None if bind.dialect.name == "mysql" else ""),
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         )

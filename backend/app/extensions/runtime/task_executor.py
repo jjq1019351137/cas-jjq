@@ -24,6 +24,7 @@ from app.models.drive_account import DriveAccount
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
 from app.models.task_savepath_snapshot import TaskSavepathSnapshot
+from app.services import audit
 from app.services.drama_share_autoupdate import is_115_auto_update_task, resolve_drama_shareurl_update
 from app.services.drive_account_lsdir_scan import trigger_drive_account_lsdir_targeted_scan
 from app.services.system_settings import get_save_rule_runtime_config
@@ -291,6 +292,119 @@ class TaskExecutor:
         defer_plugins: bool = False,
         allow_drama_plugins: bool = False,
         keep_runtime_tree: bool = False,
+        repair_banned_after: bool = False,
+        audit_actor: Any = None,
+        audit_source: str = audit.SOURCE_MANUAL,
+        audit_ip: str | None = None,
+        audit_enabled: bool = True,
+    ) -> TaskExecution:
+        """运行任务入口：统一在成功/异常出口写入运行审计。"""
+        log = log or ExecutionLog()
+        try:
+            execution = self._run_task_body(
+                task,
+                log=log,
+                persist_execution=persist_execution,
+                account_manager=account_manager,
+                init_account_for_task=init_account_for_task,
+                defer_plugins=defer_plugins,
+                allow_drama_plugins=allow_drama_plugins,
+                keep_runtime_tree=keep_runtime_tree,
+                repair_banned_after=repair_banned_after,
+            )
+        except Exception as exc:
+            if audit_enabled:
+                self._audit_task_run(
+                    task=task, execution=None, actor=audit_actor,
+                    source=audit_source, ip=audit_ip, exc=exc, log=log,
+                )
+            raise
+        if audit_enabled:
+            self._audit_task_run(
+                task=task, execution=execution, actor=audit_actor,
+                source=audit_source, ip=audit_ip,
+            )
+        return execution
+
+    def _audit_task_run(
+        self,
+        *,
+        task: Task,
+        execution: TaskExecution | None,
+        actor: Any = None,
+        source: str = audit.SOURCE_MANUAL,
+        ip: str | None = None,
+        exc: Exception | None = None,
+        log: ExecutionLog | None = None,
+    ) -> None:
+        """写入一条任务运行审计（成功/跳过/失败都记，失败带异常与运行日志）。"""
+        try:
+            task_type = str(getattr(task, "task_type", "") or "")
+            type_label = "追剧任务" if task_type == "drama" else "任务"
+            name = str(getattr(task, "taskname", "") or "")
+            target_id = getattr(task, "id", None)
+            act = audit.actor_for_source(actor, source)
+
+            if execution is not None:
+                status = str(getattr(execution, "status", "") or "")
+                message = str(getattr(execution, "message", "") or "").strip()
+                run_log = getattr(execution, "run_log", None)
+                started = getattr(execution, "started_at", None)
+                finished = getattr(execution, "finished_at", None)
+            else:
+                status = "failed"
+                message = str(getattr(exc, "message", None) or str(exc) or type(exc).__name__).strip()
+                run_log = log.render() if log is not None and hasattr(log, "render") else None
+                started = finished = None
+
+            success = status == "success"
+            dur = ""
+            try:
+                if started and finished:
+                    dur = f"（用时 {int((finished - started).total_seconds())} 秒）"
+            except Exception:
+                dur = ""
+
+            if success:
+                has_new = bool(getattr(task, "_runtime_has_new_files", False))
+                newpart = "有新文件转存" if has_new else "无新增文件"
+                summary = f"运行{type_label}《{name}》：成功，{newpart}{dur}"
+                error_message = None
+            elif status == "skipped":
+                summary = f"运行{type_label}《{name}》：跳过" + (f"——{message}" if message else "") + dur
+                error_message = None
+            else:
+                summary = f"运行{type_label}《{name}》：失败——{message}{dur}"
+                error_message = message or None
+
+            audit.audit_log_standalone(
+                actor=act,
+                action="task.run",
+                summary=summary,
+                target_type="task",
+                target_id=target_id,
+                target_name=name,
+                source=source,
+                detail=run_log,
+                success=success,
+                error_message=error_message,
+                ip=ip,
+            )
+        except Exception as e:  # 审计绝不影响主流程
+            logger.debug("[audit] task.run 审计写入失败: %s", e)
+
+    def _run_task_body(
+        self,
+        task: Task,
+        *,
+        log: ExecutionLog | None = None,
+        persist_execution: bool = True,
+        account_manager: DatabaseAccountManager | None = None,
+        init_account_for_task: bool = True,
+        defer_plugins: bool = False,
+        allow_drama_plugins: bool = False,
+        keep_runtime_tree: bool = False,
+        repair_banned_after: bool = False,
     ) -> TaskExecution:
         if not task.enabled:
             raise bad_request('TASK_DISABLED', '任务已禁用')
@@ -748,6 +862,41 @@ class TaskExecutor:
                     )
             log.section("异常")
             log.line(f"阶段={stage}: {message}")
+
+            if (
+                repair_banned_after
+                and persist_execution
+                and task_id > 0
+                and str(getattr(task, "task_type", "") or "") == "drama"
+            ):
+                log.section("自动修复")
+                try:
+                    from app.services.drama_share_repair import repair_banned_drama_tasks
+
+                    repair_result = self._write_with_session(
+                        lambda db: repair_banned_drama_tasks(db, task_ids={task_id})
+                    )
+                    repaired_items = list((repair_result or {}).get("items") or [])
+                    if repaired_items:
+                        item = repaired_items[0]
+                        se = ""
+                        if item.get("season") is not None and item.get("episode") is not None:
+                            se = f" S{int(item['season']):02d}E{int(item['episode']):02d}"
+                        log.line(
+                            "OK: 已自动修复换链"
+                            f"{se} new={str(item.get('new_shareurl') or '').strip()}"
+                        )
+                    elif int((repair_result or {}).get("checked") or 0) > 0:
+                        log.line("跳过: 未找到可用的替换链接")
+                    else:
+                        log.line("跳过: 不满足自动修复条件（需封禁/失效且关联 TMDB 剧集）")
+                except Exception as repair_exc:
+                    logger.warning(
+                        "手动运行后自动修复失败 task_id=%s err=%s",
+                        task_id,
+                        str(repair_exc).strip() or type(repair_exc).__name__,
+                    )
+                    log.line(f"失败: {str(repair_exc).strip() or type(repair_exc).__name__}")
 
             log.set_stage(stage)
             log.section("程序结束")

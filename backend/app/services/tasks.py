@@ -132,6 +132,16 @@ def create_task(db: Session, **payload) -> Task:
             raise bad_request("TASK_TMDB_ID_INVALID", "无效的 TMDB ID")
         if tmdb_id <= 0:
             raise bad_request("TASK_TMDB_ID_INVALID", "无效的 TMDB ID")
+    extra = dict(payload.get('extra') or {})
+    if (
+        str(payload.get('task_type') or 'generic') == 'drama'
+        and tmdb_id
+        and tmdb_media_type == 'tv'
+        and 'runweek_mode' not in extra
+        and not extra.get('runweek')
+    ):
+        extra['runweek_mode'] = 'auto'
+        extra.setdefault('runweek', [])
     task = Task(
         task_uid=payload.get('task_uid') or uuid.uuid4().hex,
         task_type=payload.get('task_type') or 'generic',
@@ -150,7 +160,7 @@ def create_task(db: Session, **payload) -> Task:
         tmdb_media_type=tmdb_media_type,
         enabled=payload.get('enabled', True),
         addition_json=json.dumps(payload.get('addition') or {}, ensure_ascii=False),
-        extra_json=json.dumps(payload.get('extra') or {}, ensure_ascii=False),
+        extra_json=json.dumps(extra, ensure_ascii=False),
     )
     db.add(task)
     db.flush()

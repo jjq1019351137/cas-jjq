@@ -14,7 +14,7 @@ class SyncExecutionFile(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     sync_execution_id: Mapped[int] = mapped_column(Integer, ForeignKey("sync_executions.id", ondelete="CASCADE"), nullable=False, index=True)
-    path: Mapped[str] = mapped_column(Text, nullable=False)
+    path: Mapped[str] = mapped_column(Text().with_variant(String(740), "mysql"), nullable=False)
     action: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
