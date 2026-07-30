@@ -28,6 +28,9 @@ const status = ref<'idle' | 'connecting' | 'running' | 'done' | 'error'>('idle')
 const stats = reactive({ total: 0, done: 0, copied: 0, deleted: 0, skipped: 0, failed: 0 })
 const fileEventsMap = ref(new Map<string, { ts: string; action: string; status: string; path: string; size: number | null; message: string | null }>())
 const rawLogs = ref<string[]>([])
+// 浏览器侧日志行数上限，超出后丢弃最早的行，避免长任务拖垮 DOM/内存
+const MAX_RAW_LOG_LINES = 5000
+const trimmedLogLines = ref(0)
 const stage = ref('')
 const resultMessage = ref('')
 const activeTab = ref<'files' | 'logs'>('files')
@@ -46,7 +49,7 @@ const { start, stop, isConnected } = useStreamLog({
         status.value = 'running'
         // 记录当前执行ID，用于轮询时验证
         if (data.execution_id) {
-          currentExecutionId = data.execution_id
+          setCurrentExecutionId(data.execution_id)
           // 新执行开始，清空旧文件数据
           fileEventsMap.value.clear()
           fileEventsMap.value = new Map()
@@ -60,6 +63,11 @@ const { start, stop, isConnected } = useStreamLog({
         break
       case 'log':
         rawLogs.value.push(data.line || data.message || '')
+        if (rawLogs.value.length > MAX_RAW_LOG_LINES) {
+          const overflow = rawLogs.value.length - MAX_RAW_LOG_LINES
+          rawLogs.value.splice(0, overflow)
+          trimmedLogLines.value += overflow
+        }
         nextTick(() => scrollLogsToBottom())
         break
       case 'stage':
@@ -138,6 +146,7 @@ function scrollFilesToBottom() {
 function startConnection() {
   status.value = 'connecting'
   rawLogs.value = []
+  trimmedLogLines.value = 0
   fileEventsMap.value = new Map()
   stats.total = 0
   stats.done = 0
@@ -147,7 +156,7 @@ function startConnection() {
   stats.failed = 0
   stage.value = ''
   resultMessage.value = ''
-  currentExecutionId = 0
+  setCurrentExecutionId(0)
   start()
 }
 
@@ -242,6 +251,10 @@ let pollInFlight = false
 let pollDelayMs = 3000
 let currentExecutionId = 0
 
+function setCurrentExecutionId(id: number) {
+  currentExecutionId = id
+}
+
 function resolveTaskId(): number | null {
   if (props.taskId) return props.taskId
   const match = props.url.match(/sync-tasks\/(\d+)/)
@@ -298,7 +311,7 @@ async function pollOnce() {
   const taskId = resolveTaskId()
   if (!taskId) return
   try {
-    const exe = await fetchSyncExecutionLatest(taskId, { max_log_chars: 0 })
+    const exe = await fetchSyncExecutionLatest(taskId, { max_log_chars: 200 })
     if (!exe) return
 
     const exeId = exe.id || 0
@@ -308,7 +321,7 @@ async function pollOnce() {
       // latest 返回的不是当前正在运行的执行
       if (exeId > currentExecutionId) {
         // 是更新的执行（理论上不应发生），更新追踪
-        currentExecutionId = exeId
+        setCurrentExecutionId(exeId)
       } else {
         // 是旧的已完成执行，忽略其文件数据
         return
@@ -319,14 +332,14 @@ async function pollOnce() {
     if (currentExecutionId === 0 && exeId > 0) {
       if (exe.status === 'running') {
         // 确实是正在运行的执行，可以锁定
-        currentExecutionId = exeId
+        setCurrentExecutionId(exeId)
       } else if (isConnected.value || status.value === 'connecting' || status.value === 'running') {
         // SSE 正在连接或已连接但还没收到 init，而 latest 返回的是已完成的旧执行
         // 新执行可能还没持久化到数据库，忽略此次轮询结果
         return
       } else {
         // 非实时模式（纯轮询查看历史），可以采用
-        currentExecutionId = exeId
+        setCurrentExecutionId(exeId)
       }
     }
 
@@ -537,6 +550,12 @@ onBeforeUnmount(() => {
 
             <!-- Logs Tab -->
             <div v-show="activeTab === 'logs'" class="h-full flex flex-col">
+              <div
+                v-if="trimmedLogLines > 0"
+                class="border-b border-[hsl(var(--border))] bg-amber-50 px-4 py-1.5 text-xs text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              >
+                日志过长，已省略最早的 {{ trimmedLogLines }} 行
+              </div>
               <div
                 ref="logContainerRef"
                 class="flex-1 overflow-y-auto bg-[hsl(var(--foreground))] p-4 font-mono text-sm leading-6 text-[hsl(var(--background))]"

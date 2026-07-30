@@ -541,6 +541,21 @@ def get_running_log_stream(
             "failed_files": s.get("failed_files", 0),
         }
 
+    def _stats_log_version(exe) -> int | None:
+        """从 stats_json 中取日志版本号（累计追加行数），旧记录无此字段时返回 None。"""
+        raw = exe.stats_json
+        if not raw:
+            return None
+        try:
+            s = json.loads(raw) if isinstance(raw, str) else raw
+            value = s.get("log_version")
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            return None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def gen():
         yield sse("init", {"sync_task_id": sync_task_id, "execution_id": execution_id, "started_at": datetime.now().isoformat()})
 
@@ -568,6 +583,7 @@ def get_running_log_stream(
 
         # Live tailing for running execution
         last_log_len = 0
+        last_log_version: int | None = None
         while True:
             time.sleep(2)
             with SessionLocal() as db:
@@ -581,8 +597,22 @@ def get_running_log_stream(
                 finished = exe.finished_at is not None
                 message = str(exe.message or "")
                 progress = _parse_stats(exe)
+                log_version = _stats_log_version(exe)
             # Emit new log lines
-            if len(current_log) > last_log_len:
+            if log_version is not None:
+                # run_log 可能被中间截断，长度 diff 会错位；改用版本号（累计行数）从尾部取增量
+                current_lines = current_log.splitlines()
+                if last_log_version is None:
+                    new_lines = current_lines
+                else:
+                    delta = max(0, int(log_version) - int(last_log_version))
+                    new_lines = current_lines[-delta:] if delta else []
+                for line in new_lines:
+                    if line:
+                        yield sse("log", {"line": line})
+                last_log_version = int(log_version)
+            elif len(current_log) > last_log_len:
+                # 兼容旧执行记录：按 run_log 长度增量推送
                 new_text = current_log[last_log_len:]
                 for line in new_text.splitlines():
                     if line:

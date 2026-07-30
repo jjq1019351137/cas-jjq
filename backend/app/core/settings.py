@@ -77,6 +77,10 @@ class Settings(BaseSettings):
 
     app_data_dir: str = "./data"
 
+    # 同步任务执行日志行数上限：超出后保留头部+尾部，中间截断，避免长任务 run_log 撞爆数据库
+    sync_run_log_db_max_lines: int = 2000
+    sync_run_log_db_head_lines: int = 200
+
     db_driver: str = "sqlite3"
     database_url_override: str | None = Field(default=None, validation_alias="DATABASE_URL")
     db_echo: bool = False

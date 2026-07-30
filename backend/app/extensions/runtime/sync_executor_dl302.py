@@ -11,12 +11,14 @@ from typing import Any
 
 import grpc
 from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 from treelib import Tree
 
 from app.core.errors import ApiError, bad_request
+from app.core.settings import settings
 from app.db.session import SessionLocal, is_lock_error
 from app.extensions.runtime.execution_log import ExecutionLog
 from app.extensions.runtime.plugin_hooks import PluginHookRunner
@@ -156,10 +158,11 @@ class Dl302SyncExecutor:
 
         log = log or ExecutionLog()
         log.set_stage("start")
-        log.section("同步开始")
-        log.line(f"执行时间: {log.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
-        log.line(f"任务名称: {str(getattr(task, 'name', '') or '')}")
-        log.line("")
+        if not log.lines:
+            log.section("同步开始")
+            log.line(f"执行时间: {log.started_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            log.line(f"任务名称: {str(getattr(task, 'name', '') or '')}")
+            log.line("")
 
         source = self._build_endpoint(task, side="source")
         target = self._build_endpoint(task, side="target")
@@ -196,6 +199,7 @@ class Dl302SyncExecutor:
             "done_bytes": 0,
             "dl302_task_id": None,
             "recent_events": [],
+            "log_version": 0,
         }
         execution = SyncExecution(
             sync_task_id=task_id,
@@ -218,6 +222,8 @@ class Dl302SyncExecutor:
             raise
 
         initial_stats["execution_id"] = int(execution.id)
+        log.max_lines = max(0, int(getattr(settings, "sync_run_log_db_max_lines", 2000) or 0))
+        log.head_keep = max(0, int(getattr(settings, "sync_run_log_db_head_lines", 200) or 0))
         cancel_checker = _CancelChecker(int(execution.id))
         dl302_task_id = ""
         cancel_sent = False
@@ -228,14 +234,38 @@ class Dl302SyncExecutor:
         last_stats: dict[str, Any] = dict(initial_stats)
         cached_items: list[Any] = []
         last_items_fetch_ts = 0.0
+        last_persisted_log_version = -1
+
+        def _run_log_if_changed() -> str | None:
+            nonlocal last_persisted_log_version
+            if int(log.version) == last_persisted_log_version:
+                return None
+            last_persisted_log_version = int(log.version)
+            return log.render()
+
+        def _final_items_for_refresh() -> list[Any]:
+            # 停止/异常时 cached_items 可能是节流下的旧快照，优先拉一次最新状态
+            if dl302_task_id:
+                try:
+                    resp = list_copy_task_items(task_id=dl302_task_id)
+                    fetched = list(getattr(resp, "items", []) or [])
+                    if fetched:
+                        return fetched
+                except Exception:
+                    pass
+            return list(cached_items)
 
         def persist_execution_state(*, stats_payload: dict[str, Any] | None = None, message: str | None = None) -> None:
             values: dict[str, Any] = {
                 "stage": log.stage,
                 "heartbeat_at": datetime.now(),
-                "run_log": log.render(),
             }
+            rendered = _run_log_if_changed()
+            if rendered is not None:
+                values["run_log"] = rendered
             if stats_payload is not None:
+                stats_payload = dict(stats_payload)
+                stats_payload["log_version"] = int(log.version)
                 values["stats_json"] = json.dumps(stats_payload, ensure_ascii=False)
             if message is not None:
                 values["message"] = str(message)
@@ -306,7 +336,7 @@ class Dl302SyncExecutor:
                 except Exception as exc:
                     if self._is_transient_rpc_error(exc):
                         log.line(f"dl302 轮询超时，稍后重试: {self._rpc_error_text(exc)}")
-                        self._persist_progress(execution_id=int(execution.id), log=log, stats=last_stats)
+                        self._persist_progress(execution_id=int(execution.id), log=log, stats=last_stats, run_log=_run_log_if_changed())
                         time.sleep(1.5)
                         continue
                     raise
@@ -328,9 +358,9 @@ class Dl302SyncExecutor:
                     )
                     last_status = task_status
 
-                if task_message and task_message != "ok":
+                if task_message and task_message != "ok" and task_message != last_task_message:
                     now_ts = time.monotonic()
-                    if task_message != last_task_message or (now_ts - float(last_task_message_ts)) >= 5.0:
+                    if not last_task_message or (now_ts - float(last_task_message_ts)) >= 5.0:
                         log.line(f"dl302 进度: {task_message}")
                         last_task_message = task_message
                         last_task_message_ts = now_ts
@@ -347,8 +377,9 @@ class Dl302SyncExecutor:
                         mapped_status = self._map_item_status(status)
                         msg = self._item_event_message(item)
                         if status in {"running", "done", "failed", "skipped", "cancelled"}:
-                            suffix = f" msg={msg}" if msg else ""
-                            log.line(f"文件状态: {status} path={path}{suffix}")
+                            if status in {"failed", "cancelled"}:
+                                suffix = f" msg={msg}" if msg else ""
+                                log.line(f"文件状态: {status} path={path}{suffix}")
                             event = self._build_progress_event(item, path=path, status=mapped_status, message=msg or None)
                             self._push_recent_event(stats, event)
                             self._emit_progress(log, stats, event=event)
@@ -361,7 +392,7 @@ class Dl302SyncExecutor:
                     except Exception as exc:
                         log.line(f"dl302 取消请求失败: {str(exc).strip() or type(exc).__name__}")
 
-                self._persist_progress(execution_id=int(execution.id), log=log, stats=stats)
+                self._persist_progress(execution_id=int(execution.id), log=log, stats=stats, run_log=_run_log_if_changed())
                 self._emit_progress(log, stats)
                 last_stats = dict(stats)
 
@@ -423,6 +454,7 @@ class Dl302SyncExecutor:
 
             execution.finished_at = datetime.now()
             execution.stage = log.stage
+            final_stats["log_version"] = int(log.version)
             execution.stats_json = json.dumps(final_stats, ensure_ascii=False)
             execution.run_log = log.render()
             execution.heartbeat_at = datetime.now()
@@ -444,7 +476,10 @@ class Dl302SyncExecutor:
             log.line(message)
             # 已复制成功的文件仍需刷新目录缓存（尽力而为）
             try:
-                self._trigger_post_sync_lsdir_refresh(target=target, items=cached_items, log=log)
+                aborted_items = _final_items_for_refresh()
+                self._sync_file_rows(int(execution.id), aborted_items, active_only=False)
+                self._mark_inflight_rows_aborted(int(execution.id))
+                self._trigger_post_sync_lsdir_refresh(target=target, items=aborted_items, log=log)
             except Exception:
                 pass
             execution.status = "aborted"
@@ -463,7 +498,7 @@ class Dl302SyncExecutor:
             log.line(message)
             # 已复制成功的文件仍需刷新目录缓存（尽力而为）
             try:
-                self._trigger_post_sync_lsdir_refresh(target=target, items=cached_items, log=log)
+                self._trigger_post_sync_lsdir_refresh(target=target, items=_final_items_for_refresh(), log=log)
             except Exception:
                 pass
             execution.status = "failed"
@@ -1039,6 +1074,21 @@ class Dl302SyncExecutor:
             "cancelled": "aborted",
         }.get(str(status or "").strip(), "pending")
 
+    @staticmethod
+    def _build_sync_execution_file_upsert_stmt(payload: dict[str, Any], *, dialect_name: str):
+        set_values = {
+            "action": payload["action"],
+            "status": payload["status"],
+            "size": payload["size"],
+            "message": payload["message"],
+            "updated_at": payload["updated_at"],
+        }
+        if str(dialect_name or "").strip().lower() == "mysql":
+            stmt = mysql_insert(SyncExecutionFile).values(**payload)
+            return stmt.on_duplicate_key_update(**set_values)
+        stmt = sqlite_insert(SyncExecutionFile).values(**payload)
+        return stmt.on_conflict_do_update(index_elements=["sync_execution_id", "path"], set_=set_values)
+
     def _sync_file_rows(self, execution_id: int, items, *, active_only: bool = False) -> None:
         rows: list[dict[str, Any]] = []
         now = datetime.now()
@@ -1068,19 +1118,9 @@ class Dl302SyncExecutor:
             chunk = rows[start : start + chunk_size]
 
             def _write_chunk(db: Session) -> None:
+                dialect_name = db.get_bind().dialect.name
                 for payload in chunk:
-                    stmt = sqlite_insert(SyncExecutionFile).values(**payload)
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=["sync_execution_id", "path"],
-                        set_={
-                            "action": payload["action"],
-                            "status": payload["status"],
-                            "size": payload["size"],
-                            "message": payload["message"],
-                            "updated_at": payload["updated_at"],
-                        },
-                    )
-                    db.execute(stmt)
+                    db.execute(self._build_sync_execution_file_upsert_stmt(payload, dialect_name=dialect_name))
 
             self._write_with_session(_write_chunk)
         if active_only:
@@ -1108,17 +1148,21 @@ class Dl302SyncExecutor:
             )
         )
 
-    def _persist_progress(self, *, execution_id: int, log: ExecutionLog, stats: dict[str, Any]) -> None:
+    def _persist_progress(self, *, execution_id: int, log: ExecutionLog, stats: dict[str, Any], run_log: str | None = None) -> None:
+        stats = dict(stats)
+        stats["log_version"] = int(log.version)
+        values: dict[str, Any] = {
+            "stage": log.stage,
+            "heartbeat_at": datetime.now(),
+            "stats_json": json.dumps(stats, ensure_ascii=False),
+            "message": str(stats.get("dl302_task_id") or ""),
+        }
+        if run_log is not None:
+            values["run_log"] = run_log
         self._write_with_session(
             lambda db: db.execute(
                 update(SyncExecution)
                 .where(SyncExecution.id == int(execution_id))
-                .values(
-                    stage=log.stage,
-                    heartbeat_at=datetime.now(),
-                    stats_json=json.dumps(stats, ensure_ascii=False),
-                    run_log=log.render(),
-                    message=str(stats.get("dl302_task_id") or ""),
-                )
+                .values(**values)
             )
         )
