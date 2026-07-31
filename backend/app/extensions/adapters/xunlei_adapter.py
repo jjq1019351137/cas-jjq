@@ -157,9 +157,12 @@ class XunleiAdapter(BaseCloudDriveAdapter):
         # 账户名称（用于多账户配置保存）
         self._account_name: str = account_name
 
-        # 双 Token
-        self._access_token: str = ""
-        self._access_token_expire: float = 0
+        # 双 Token（access_token 随刷新落库，重启后从配置恢复复用）
+        self._access_token: str = str(self.config.get("access_token") or "").strip()
+        try:
+            self._access_token_expire: float = float(self.config.get("access_token_expire") or 0)
+        except (TypeError, ValueError):
+            self._access_token_expire = 0
         self._captcha_token: str = ""
         self._captcha_token_expire: float = 0
 
@@ -169,9 +172,14 @@ class XunleiAdapter(BaseCloudDriveAdapter):
         # 设备 ID（使用固定值，与 captcha_sign 配套）
         self._device_id: str = DEVICE_ID
 
-        # 用户信息
-        self._user_id: str = ""
-        self._user_name: str = ""
+        # 用户信息（随 token 一并落库恢复）
+        self._user_id: str = str(self.config.get("user_id") or "")
+        self._user_name: str = str(self.config.get("user_name") or "")
+
+        # 恢复的 access_token 仍在有效期内时直接挂到会话头，避免重启后额外刷新
+        if self._access_token and time.time() < self._access_token_expire:
+            self._session.headers["Authorization"] = f"Bearer {self._access_token}"
+            self._session.headers["x-device-id"] = self._device_id
 
         # 线程锁
         self._token_lock = threading.Lock()
@@ -208,13 +216,11 @@ class XunleiAdapter(BaseCloudDriveAdapter):
             self._access_token = result["access_token"]
             self._access_token_expire = time.time() + int(result.get("expires_in", 7200)) - 120
 
-            # 更新 refresh_token
+            # 更新 refresh_token（迅雷会轮转）
             new_refresh = result.get("refresh_token", "")
             if new_refresh and new_refresh != self._refresh_token:
-                old_token = self._refresh_token
                 self._refresh_token = new_refresh
-                self._save_refresh_token()
-                logger.debug("[Xunlei] refresh_token 已更新")
+                logger.debug("[Xunlei] refresh_token 已轮转")
 
             # 提取用户信息
             self._user_id = str(result.get("user_id", ""))
@@ -223,6 +229,9 @@ class XunleiAdapter(BaseCloudDriveAdapter):
             # 更新 session headers
             self._session.headers["Authorization"] = f"Bearer {self._access_token}"
             self._session.headers["x-device-id"] = self._device_id
+
+            # access_token 与轮转后的 refresh_token 一并落库，重启后可直接复用
+            self._save_refresh_token()
 
             logger.debug(f"[Xunlei] access_token 刷新成功，用户: {self._user_name or self._user_id}")
             return True
@@ -300,11 +309,29 @@ class XunleiAdapter(BaseCloudDriveAdapter):
         return True
 
     def _save_refresh_token(self):
-        """保存新的 refresh_token 到配置文件"""
+        """持久化最新 token（由启动时注入的 DB saver 写回 drive_accounts）"""
         global _global_config_saver
-        if _global_config_saver:
-            _global_config_saver(self._refresh_token, self._account_name)
+        if not _global_config_saver:
+            return
+        try:
+            _global_config_saver(self.export_runtime_config(), self._account_name)
             self._token_updated_at = time.time()
+        except Exception as e:
+            logger.warning(f"[Xunlei] 持久化 token 失败: {e}")
+
+    def _sync_runtime_config(self) -> None:
+        self.config["refresh_token"] = self._refresh_token
+        self.config["access_token"] = self._access_token
+        self.config["access_token_expire"] = self._access_token_expire
+        if self._user_id:
+            self.config["user_id"] = self._user_id
+        if self._user_name:
+            self.config["user_name"] = self._user_name
+        self.cookie = self.serialize_config(self.config)
+
+    def export_runtime_config(self) -> dict[str, Any]:
+        self._sync_runtime_config()
+        return dict(self.config)
 
     # ==================== 请求方法 ====================
 

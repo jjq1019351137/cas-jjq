@@ -19,6 +19,7 @@ from app.core.settings import settings
 from app.db.session import SessionLocal, driver
 from app.extensions.runtime.telegram_bot_manager import telegram_bot_manager
 from app.extensions.runtime.task_scheduler import task_scheduler_manager
+from app.extensions.runtime.adapter_credential_store import install_adapter_config_savers
 from app.middlewares.timing import TimingMiddleware
 from app.services.proxy_image_cache import ensure_dir, resolve_proxy_image_cache_dir
 from app.services.drive_account_lsdir_scan import recover_incomplete_drive_account_lsdir_scans, recover_incomplete_drive_account_static_scans
@@ -60,6 +61,8 @@ def create_app() -> FastAPI:
     setup_logging()
     _prepare_db_environment()
     _ensure_proxy_image_cache_dir()
+    # 接入驱动 token 落库回调（xunlei/aliyun/cloud189/123pan 刷新、轮转后写回 drive_accounts）
+    install_adapter_config_savers()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

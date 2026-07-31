@@ -620,7 +620,8 @@ FlhDeqVOG094hFJvZeK4OzA6HVwzwnEW5vIZ7d+u61RV1bsFxmB68+8JXs3ycGcE
     def _persist_cookie(self):
         if callable(_global_config_saver):
             try:
-                _global_config_saver(self.cookie)
+                # 优先用工厂注入的 DB 账号名，kv 里的 name 可能与 drive_accounts.name 不一致
+                _global_config_saver(self.cookie, getattr(self, "account_name", "") or self._account_name)
             except Exception as e:
                 logger.warning(f"[cloud189] persist cookie failed: {e}")
 

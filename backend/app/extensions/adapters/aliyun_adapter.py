@@ -225,6 +225,28 @@ class AliyunAdapter(BaseCloudDriveAdapter):
         self._token_lock = threading.Lock()
         self._save_task_contexts: dict[str, dict[str, Any]] = {}
 
+        # 从配置恢复上次落库的 access_token，仍在有效期内则直接复用，避免重启后额外刷新
+        restored_data = {
+            key: self.config.get(key)
+            for key in (
+                "access_token",
+                "expires_in",
+                "token_type",
+                "user_id",
+                "user_name",
+                "nick_name",
+                "default_drive_id",
+                "default_sbox_drive_id",
+                "expire_time",
+            )
+            if self.config.get(key) is not None
+        }
+        if restored_data.get("access_token"):
+            restored = AliyunToken({**restored_data, "refresh_token": self._refresh_token})
+            if not restored.is_expired:
+                self._token = restored
+                self._session.headers["Authorization"] = f"Bearer {restored.access_token}"
+
     def _get_error_message(self, code: str) -> str:
         """获取错误码对应的提示信息"""
         return self.ERROR_CODES.get(code, f"未知错误 ({code})")
@@ -262,15 +284,14 @@ class AliyunAdapter(BaseCloudDriveAdapter):
                 
                 # 更新 token
                 self._token = AliyunToken(result)
-                old_refresh_token = self._refresh_token
-                self._refresh_token = self._token.refresh_token
-                
+                if self._token.refresh_token:
+                    self._refresh_token = self._token.refresh_token
+
                 # 更新 session 的 Authorization header
                 self._session.headers["Authorization"] = f"Bearer {self._token.access_token}"
-                
-                # 如果 refresh_token 变化了，保存到配置文件
-                if old_refresh_token != self._refresh_token:
-                    self._save_refresh_token()
+
+                # access_token 与轮转后的 refresh_token 一并落库，重启后可直接复用
+                self._save_refresh_token()
                 
                 logger.info(f"[Aliyun] Token 刷新成功，用户: {self._token.nick_name}")
                 return True
@@ -280,10 +301,24 @@ class AliyunAdapter(BaseCloudDriveAdapter):
                 return False
 
     def _save_refresh_token(self):
-        """保存新的 refresh_token 到配置文件"""
+        """持久化最新 token（由启动时注入的 DB saver 写回 drive_accounts）"""
         global _global_config_saver
-        if _global_config_saver:
-            _global_config_saver(self._refresh_token, self._account_name)
+        if not _global_config_saver:
+            return
+        try:
+            _global_config_saver(self.export_runtime_config(), self._account_name)
+        except Exception as e:
+            logger.warning(f"[Aliyun] 持久化 token 失败: {e}")
+
+    def _sync_runtime_config(self) -> None:
+        if self._token is not None:
+            self.config.update(self._token.to_dict())
+        self.config["refresh_token"] = self._refresh_token
+        self.cookie = self.serialize_config(self.config)
+
+    def export_runtime_config(self) -> dict[str, Any]:
+        self._sync_runtime_config()
+        return dict(self.config)
 
     def _ensure_token_valid(self) -> bool:
         """确保 token 有效"""
