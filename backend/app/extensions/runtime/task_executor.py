@@ -791,18 +791,6 @@ class TaskExecutor:
             duration_s = (finished_at_local - log.started_at).total_seconds()
             log.line(f"状态: success")
             log.line(f"运行时长: {duration_s:.2f}s")
-            allow_once = bool((task_data.get("extra") or {}).get("allow_once"))
-            if (
-                persist_execution
-                and task_id > 0
-                and str(task_data.get("task_type") or "") == "drama"
-                and allow_once
-                and bool(getattr(task, "enabled", False))
-            ):
-                self._write_with_session(
-                    lambda db: setattr(db.get(Task, task_id), "enabled", False) if db.get(Task, task_id) is not None else None
-                )
-                log.line("运行一次: 本次执行成功，已自动禁用任务")
             payload = ExecutionPayload(
                 status='success',
                 message='执行完成',

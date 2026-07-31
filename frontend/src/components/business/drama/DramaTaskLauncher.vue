@@ -23,5 +23,6 @@ const props = defineProps<{
     :title="props.launcher.streamLogTitle.value"
     :method="props.launcher.streamLogMethod.value"
     :body="props.launcher.streamLogBody.value"
+    @done="props.launcher.handleStreamDone"
   />
 </template>

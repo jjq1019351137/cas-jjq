@@ -1,10 +1,12 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useQueryClient } from '@tanstack/vue-query'
 import { useTasksQuery } from '@/hooks/queries/tasks'
 import type { DramaTaskPreset } from '@/types/dramaLauncher'
 import type { TaskItem } from '@/types/tasks'
 
 export function useDramaTaskLauncher() {
   const { data: tasks } = useTasksQuery()
+  const queryClient = useQueryClient()
 
   const sheetOpen = ref(false)
   const editingTask = ref<TaskItem | undefined>(undefined)
@@ -15,6 +17,20 @@ export function useDramaTaskLauncher() {
   const streamLogTitle = ref('执行日志')
   const streamLogMethod = ref<'GET' | 'POST'>('GET')
   const streamLogBody = ref<Record<string, any> | null>(null)
+
+  // 执行过程可能改动任务本身（自动修复换链、115自动换链、进度快照），
+  // 流结束或弹窗关闭都要让任务列表失效，否则卡片仍是旧链接，再次运行会用旧数据构造 payload
+  function invalidateTasks() {
+    queryClient.invalidateQueries({ queryKey: ['tasks'] })
+  }
+
+  function handleStreamDone() {
+    invalidateTasks()
+  }
+
+  watch(showStreamLog, (visible, previous) => {
+    if (previous && !visible) invalidateTasks()
+  })
 
   function findExistingTask(tmdbId: number, mediaType: string): TaskItem | undefined {
     if (!tmdbId) return undefined
@@ -94,5 +110,6 @@ export function useDramaTaskLauncher() {
     openFromPreset,
     close,
     handleRunOnce,
+    handleStreamDone,
   }
 }

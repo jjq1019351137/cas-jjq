@@ -116,7 +116,18 @@
    Reusable across all pages for a consistent modern look:
    - .glass-card   : frosted container panel
    - .glass-tile   : compact metric tile with hover lift
-   - .page-title   : emoji + bold title header helper */
+   - .page-title   : emoji + bold title header helper
+
+   Apple-style additions (see block at the end of this file):
+   - .glass-panel / --interactive : frosted section panel with top highlight
+   - .glass-inset                 : nested lighter surface inside a panel
+   - .pill / .pill--*             : capsule status label
+   - .filter-pill / --active      : segmented filter chip with count bubble
+   - .icon-action / --danger      : circular icon button with press feedback
+   - .field-input / .field-label  : form input surface and its readable label
+   - .section-heading             : form section heading with hairline underline
+   - .modal-surface / .modal-bar  : floating dialog surface and its header/footer bar
+   - .hairline / .panel-title     : 1px separator, compact panel heading */
 @layer components {
   .glass-card {
     border-radius: 1.15rem;
@@ -169,5 +180,335 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+}
+
+/* ===== Apple-style glass primitives =====
+   Shared by the drama task page (list / cards / sheets / dialogs).
+   Motion uses the iOS spring-like easing cubic-bezier(0.32, 0.72, 0, 1). */
+@layer components {
+  /* --- Frosted panel --- */
+  .glass-panel {
+    position: relative;
+    border-radius: 1.15rem;
+    border: 1px solid hsl(var(--border) / 0.8);
+    background: hsl(var(--card) / 0.78);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
+  }
+
+  /* Top specular highlight, the signature of iOS material surfaces */
+  .glass-panel::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 40%;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(180deg, rgb(255 255 255 / 0.28), transparent);
+  }
+
+  .dark .glass-panel::before {
+    background: linear-gradient(180deg, rgb(255 255 255 / 0.07), transparent);
+  }
+
+  .glass-panel--interactive {
+    transition:
+      transform 0.24s cubic-bezier(0.32, 0.72, 0, 1),
+      box-shadow 0.24s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+
+  .glass-panel--interactive:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 30px rgb(0 0 0 / 0.1);
+  }
+
+  /* Nested lighter surface, e.g. the progress block inside a task card */
+  .glass-inset {
+    border-radius: 0.8rem;
+    border: 1px solid hsl(var(--border) / 0.8);
+    background: hsl(var(--muted) / 0.6);
+  }
+
+  .hairline {
+    height: 1px;
+    background: hsl(var(--border));
+  }
+
+  .panel-title {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: hsl(var(--foreground));
+  }
+
+  /* --- Capsule status label --- */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-radius: 9999px;
+    border: 1px solid transparent;
+    padding: 0.05rem 0.5rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+
+  .pill--muted {
+    background: hsl(var(--muted));
+    border-color: hsl(var(--border));
+    color: hsl(var(--foreground) / 0.72);
+  }
+
+  .pill--success {
+    background: hsl(145 63% 42% / 0.14);
+    border-color: hsl(145 63% 42% / 0.28);
+    color: hsl(145 63% 32%);
+  }
+
+  .pill--warning {
+    background: hsl(35 92% 50% / 0.16);
+    border-color: hsl(35 92% 50% / 0.3);
+    color: hsl(30 90% 38%);
+  }
+
+  .pill--danger {
+    background: hsl(0 72% 51% / 0.14);
+    border-color: hsl(0 72% 51% / 0.28);
+    color: hsl(0 72% 44%);
+  }
+
+  .pill--teal {
+    background: hsl(160 60% 42% / 0.14);
+    border-color: hsl(160 60% 42% / 0.28);
+    color: hsl(160 60% 30%);
+  }
+
+  .pill--info {
+    background: hsl(210 90% 55% / 0.14);
+    border-color: hsl(210 90% 55% / 0.28);
+    color: hsl(210 90% 42%);
+  }
+
+  .pill--primary {
+    background: hsl(221 83% 53% / 0.12);
+    border-color: hsl(221 83% 53% / 0.26);
+    color: hsl(221 83% 45%);
+  }
+
+  .pill--accent {
+    background: hsl(265 70% 58% / 0.12);
+    border-color: hsl(265 70% 58% / 0.26);
+    color: hsl(265 70% 48%);
+  }
+
+  .dark .pill--success,
+  .dark .pill--teal {
+    color: hsl(145 70% 68%);
+  }
+
+  .dark .pill--warning {
+    color: hsl(35 95% 70%);
+  }
+
+  .dark .pill--danger {
+    color: hsl(0 85% 72%);
+  }
+
+  .dark .pill--info,
+  .dark .pill--primary {
+    color: hsl(210 95% 74%);
+  }
+
+  .dark .pill--accent {
+    color: hsl(265 85% 78%);
+  }
+
+  /* --- Segmented filter chip --- */
+  .filter-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border-radius: 9999px;
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--background));
+    padding: 0.25rem 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: hsl(var(--foreground) / 0.72);
+    cursor: pointer;
+    transition:
+      transform 0.18s cubic-bezier(0.32, 0.72, 0, 1),
+      background-color 0.18s ease,
+      border-color 0.18s ease,
+      color 0.18s ease,
+      box-shadow 0.18s ease;
+  }
+
+  .filter-pill:hover {
+    background: hsl(var(--accent));
+    border-color: hsl(var(--muted-foreground) / 0.5);
+    color: hsl(var(--foreground));
+  }
+
+  .filter-pill:active {
+    transform: scale(0.96);
+  }
+
+  .filter-pill--active,
+  .filter-pill--active:hover {
+    background: hsl(var(--primary));
+    border-color: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    box-shadow: 0 2px 10px hsl(var(--primary) / 0.3);
+  }
+
+  .filter-pill__count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.125rem;
+    padding: 0 0.25rem;
+    border-radius: 9999px;
+    background: hsl(var(--muted));
+    font-size: 0.625rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1rem;
+    color: hsl(var(--foreground) / 0.7);
+  }
+
+  .filter-pill--active .filter-pill__count {
+    background: hsl(var(--primary-foreground) / 0.22);
+    color: hsl(var(--primary-foreground));
+  }
+
+  /* --- Circular icon button --- */
+  .icon-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 1.75rem;
+    width: 1.75rem;
+    flex-shrink: 0;
+    border: none;
+    border-radius: 9999px;
+    background: transparent;
+    color: hsl(var(--muted-foreground));
+    cursor: pointer;
+    transition:
+      transform 0.18s cubic-bezier(0.32, 0.72, 0, 1),
+      background-color 0.18s ease,
+      color 0.18s ease;
+  }
+
+  .icon-action:hover {
+    background: hsl(var(--muted));
+    color: hsl(var(--foreground));
+    transform: scale(1.1);
+  }
+
+  .icon-action:active {
+    transform: scale(0.94);
+  }
+
+  .icon-action:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .icon-action--on {
+    color: hsl(145 63% 42%);
+  }
+
+  .icon-action--danger {
+    color: hsl(0 72% 51%);
+  }
+
+  .icon-action--danger:hover {
+    background: hsl(0 72% 51% / 0.12);
+    color: hsl(0 72% 45%);
+  }
+
+  /* --- Form field ---
+     Backgrounds are fully opaque on purpose: a translucent field stacked on a
+     translucent panel destroys text/border contrast. */
+  .field-input {
+    display: flex;
+    height: 2.25rem;
+    width: 100%;
+    border-radius: 0.5rem;
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--background));
+    padding: 0.25rem 0.75rem;
+    font-size: 0.875rem;
+    color: hsl(var(--foreground));
+    transition:
+      border-color 0.18s ease,
+      box-shadow 0.18s ease;
+  }
+
+  .field-input:hover:not(:disabled) {
+    border-color: hsl(var(--muted-foreground) / 0.6);
+  }
+
+  .field-input:focus-visible {
+    outline: none;
+    border-color: hsl(var(--ring));
+    box-shadow: 0 0 0 3px hsl(var(--ring) / 0.2);
+  }
+
+  .field-input:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  /* Form field label: readable secondary tone instead of low-contrast muted */
+  .field-label {
+    display: block;
+    margin-bottom: 0.375rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: hsl(var(--foreground) / 0.78);
+  }
+
+  .field-label--inline {
+    display: inline-block;
+    margin-bottom: 0.125rem;
+  }
+
+  /* --- Section heading with hairline underline --- */
+  .section-heading {
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid hsl(var(--border));
+    font-size: 0.8125rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: hsl(var(--foreground));
+  }
+
+  /* --- Floating modal / drawer surface ---
+     Nearly opaque: dense forms and tables need contrast, so the frosted
+     effect is carried by .modal-bar (header/footer) rather than the body. */
+  .modal-surface {
+    border-radius: 1.15rem;
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--background) / 0.97);
+    backdrop-filter: blur(28px) saturate(1.8);
+    -webkit-backdrop-filter: blur(28px) saturate(1.8);
+    box-shadow: 0 24px 70px rgb(0 0 0 / 0.22);
+  }
+
+  /* Frosted header / footer bar inside a modal or drawer */
+  .modal-bar {
+    background: hsl(var(--muted) / 0.4);
+    backdrop-filter: blur(16px) saturate(1.6);
+    -webkit-backdrop-filter: blur(16px) saturate(1.6);
   }
 }

@@ -189,10 +189,10 @@ const progressPercent = computed(() => {
         />
         <!-- Panel -->
         <div
-          class="relative z-10 flex h-[85vh] w-[90vw] max-w-5xl flex-col overflow-hidden rounded-lg bg-[hsl(var(--card))] shadow-2xl"
+          class="modal-surface relative z-10 flex h-[85vh] w-[90vw] max-w-5xl flex-col overflow-hidden"
         >
           <!-- Header -->
-          <div class="flex items-center justify-between border-b border-[hsl(var(--border))] px-5 py-3">
+          <div class="modal-bar flex items-center justify-between border-b border-[hsl(var(--border))] px-5 py-3">
             <div class="flex items-center gap-3">
               <h2 class="text-base font-semibold text-[hsl(var(--card-foreground))]">
                 {{ title }}
@@ -205,7 +205,7 @@ const progressPercent = computed(() => {
               </span>
             </div>
             <button
-              class="flex h-8 w-8 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
+              class="icon-action h-8 w-8"
               @click="close"
             >
               <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -243,7 +243,7 @@ const progressPercent = computed(() => {
           </div>
 
           <!-- Footer -->
-          <div class="flex items-center justify-between border-t border-[hsl(var(--border))] px-5 py-3">
+          <div class="modal-bar flex items-center justify-between border-t border-[hsl(var(--border))] px-5 py-3">
             <!-- Progress -->
             <div class="flex flex-1 items-center gap-3">
               <template v-if="progress">
@@ -261,7 +261,7 @@ const progressPercent = computed(() => {
             <!-- Actions -->
             <div class="flex items-center gap-2">
               <button
-                class="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
+                class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
                 @click="handleClear"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -270,7 +270,7 @@ const progressPercent = computed(() => {
                 清空
               </button>
               <button
-                class="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
+                class="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
                 @click="handleCopy"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

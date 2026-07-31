@@ -28,3 +28,4 @@ dl302-bin
 Dockerfiledev
 issues.md
 test_match_flow.*
+vector_search.py

@@ -1005,25 +1005,31 @@ def post_run_task_stream(request: Request, task_id: int, current: CurrentUser = 
 def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, current: CurrentUser = Depends(get_current_user_scoped)):
     import uuid
 
+    is_run_once = bool(str(payload.task_uid or "").strip())
+    actor_user_id = int(getattr(current.user, "id", 0) or 0)
+    actor_username = str(getattr(current.user, "username", "") or "") or None
+    audit_ip = request.client.host if request.client else None
+
     init_payload = {
         "task_id": 0,
         "taskname": str(payload.taskname),
         "started_at": datetime.now().isoformat(),
         "preview": True,
     }
-    with SessionLocal() as adb:
-        audit.write_audit_log(
-            adb,
-            actor_user_id=current.user.id,
-            action='task.run.preview_stream',
-            target_type='task',
-            target_id='0',
-            ip=request.client.host if request.client else None,
-            user_agent=request.headers.get('user-agent'),
-            success=True,
-            detail=str(payload.taskname or ""),
-        )
-        adb.commit()
+    if not is_run_once:
+        with SessionLocal() as adb:
+            audit.write_audit_log(
+                adb,
+                actor_user_id=current.user.id,
+                action='task.run.preview_stream',
+                target_type='task',
+                target_id='0',
+                ip=audit_ip,
+                user_agent=request.headers.get('user-agent'),
+                success=True,
+                detail=str(payload.taskname or ""),
+            )
+            adb.commit()
 
     q: queue.Queue[tuple[str, object]] = queue.Queue()
     done_sentinel = object()
@@ -1075,7 +1081,11 @@ def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, cur
                     log=log,
                     persist_execution=bool(existing_task_id > 0),
                     repair_banned_after=bool(existing_task_id > 0),
-                    audit_enabled=False,
+                    # 运行一次记 task.run 审计（以意图为准，即使任务行已不存在也留痕）；纯预览不记，避免试跑刷屏
+                    audit_enabled=is_run_once,
+                    audit_actor=audit.user_actor(actor_user_id, actor_username),
+                    audit_source=audit.SOURCE_MANUAL,
+                    audit_ip=audit_ip,
                 )
                 if str(getattr(wtask, "task_type", "") or "") == "drama":
                     if should_trigger_linked_sync_for_drama_execution(execution):

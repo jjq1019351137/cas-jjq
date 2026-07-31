@@ -246,6 +246,7 @@ class DramaTaskExecutor:
         self.transfer_count = 0
         self.changed_relative_dirs: set[str] = set()
         self.saved_history_entries: list[dict[str, str | None]] = []
+        self._subdir_sync_failures = 0
         self.history_name_set = self._build_history_name_set(self._load_transfer_history())
 
     def _set_stage(self, stage: str | None) -> None:
@@ -498,6 +499,16 @@ class DramaTaskExecutor:
             allow_empty_result=all_dirs,
         )
         self._remember_saved_history(saved_fids=saved_fids, plan=plan)
+
+    def _save_items_tolerant(self, *, pwd_id: str, stoken: str, to_pdir_fid: str, items: list[dict[str, Any]], context: str) -> bool:
+        """子目录同步中的容错转存：单项失败记日志并计数，不中断整个任务。"""
+        try:
+            self._save_items(pwd_id=pwd_id, stoken=stoken, to_pdir_fid=to_pdir_fid, items=items)
+            return True
+        except Exception as exc:
+            self._subdir_sync_failures += 1
+            self._line(f"FAIL: 转存失败 {context} err={str(exc).strip() or type(exc).__name__}")
+            return False
 
     def _call_save_file(
         self,
@@ -755,7 +766,11 @@ class DramaTaskExecutor:
                         )
                         continue
                     self._line(f"提示: 创建目录失败，回退整目录转存 {share_dir_name}/{name}")
-                self._save_items(pwd_id=pwd_id, stoken=stoken, to_pdir_fid=dest_dir_fid, items=[raw])
+                if not self._save_items_tolerant(
+                    pwd_id=pwd_id, stoken=stoken, to_pdir_fid=dest_dir_fid, items=[raw],
+                    context=f"{share_dir_name}/{name}",
+                ):
+                    continue
                 tree.create_node(f"📁{name}", f"dir-new-{dest_dir_name}-{fid}", parent=parent_node)
                 continue
             # 子目录内文件仍按 pattern 过滤（仅过滤，不重命名）
@@ -771,7 +786,11 @@ class DramaTaskExecutor:
                 self._line(f"跳过: 历史已转存 origin={name} target={name}")
                 continue
             self._mark_changed_dir(dest_relative_path)
-            self._save_items(pwd_id=pwd_id, stoken=stoken, to_pdir_fid=dest_dir_fid, items=[raw])
+            if not self._save_items_tolerant(
+                pwd_id=pwd_id, stoken=stoken, to_pdir_fid=dest_dir_fid, items=[raw],
+                context=f"{share_dir_name}/{name}",
+            ):
+                continue
             tree.create_node(f"{name} -> {name}", f"file-{dest_dir_name}-{fid}", parent=parent_node)
 
     def _compile_subdir_file_pattern(self) -> re.Pattern[str] | None:
@@ -1216,7 +1235,8 @@ class DramaTaskExecutor:
                         )
                         continue
                     self._line(f"提示: 创建目录失败，回退整目录转存 {name}")
-                    self._save_items(pwd_id=str(pwd_id), stoken=str(stoken), to_pdir_fid=dest_root_fid, items=[raw])
+                    if not self._save_items_tolerant(pwd_id=str(pwd_id), stoken=str(stoken), to_pdir_fid=dest_root_fid, items=[raw], context=name):
+                        continue
                     tree.create_node(f"📁{name}（重存）", f"dir-resave-{fid}", parent="root")
                     continue
                 existing_dest_fid = dest_dir_map.get(name)
@@ -1263,8 +1283,12 @@ class DramaTaskExecutor:
                     )
                     continue
                 self._line(f"提示: 创建目录失败，回退整目录转存 {name}")
-                self._save_items(pwd_id=str(pwd_id), stoken=str(stoken), to_pdir_fid=dest_root_fid, items=[raw])
+                if not self._save_items_tolerant(pwd_id=str(pwd_id), stoken=str(stoken), to_pdir_fid=dest_root_fid, items=[raw], context=name):
+                    continue
                 tree.create_node(f"📁{name}", f"dir-new-{fid}", parent="root")
+
+            if self._subdir_sync_failures:
+                self._line(f"提示: 子目录转存存在 {self._subdir_sync_failures} 项失败，已跳过，下次运行将自动重试")
 
         if tree.size() <= 1:
             tree.create_node("无可转存文件", "empty", parent="root")

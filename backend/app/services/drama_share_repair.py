@@ -22,6 +22,7 @@ from app.services.drama_share_autoupdate import resolve_drama_shareurl_update
 from app.services.resource_search import fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
 from app.services.title_match import extract_progress, title_matches_names
+from app.services.title_vector_match import is_vector_fallback_enabled, vector_recall
 from app.services.tmdb_cache import get_tmdb_detail_cached
 
 
@@ -266,6 +267,7 @@ def repair_banned_drama_tasks(
             removed_mismatch = 0
             removed_empty = 0
             removed_title_mismatch = 0
+            mismatch_pool: list[dict] = []
             last_kw = ""
             last_msg = None
             for kw in _pick_search_keywords(db, task):
@@ -305,6 +307,7 @@ def repair_banned_drama_tasks(
                                 f"[repair] task_id={task_id} skip_candidate reason=title_mismatch title={title} names={match_names}"
                             )
                         removed_title_mismatch += 1
+                        mismatch_pool.append({"shareurl": url, "taskname": title})
                         continue
                     seen.add(url)
                     candidate_urls.append(url)
@@ -313,6 +316,27 @@ def repair_banned_drama_tasks(
                         break
                 if candidate_urls:
                     break
+            if not candidate_urls and mismatch_pool and match_names and is_vector_fallback_enabled():
+                pool_titles = [str(x.get("taskname") or "") for x in mismatch_pool]
+                for index, score in vector_recall(pool_titles, match_names):
+                    _season, episode = extract_progress(pool_titles[index])
+                    if episode is None:
+                        continue
+                    url = str(mismatch_pool[index].get("shareurl") or "").strip()
+                    if not url or url in seen:
+                        continue
+                    seen.add(url)
+                    candidate_urls.append(url)
+                    candidate_titles[url] = pool_titles[index]
+                    logger.info(
+                        "[repair] vector_fallback task_id=%s score=%s title=%s url=%s",
+                        task_id,
+                        round(score, 4),
+                        pool_titles[index],
+                        url,
+                    )
+                    if len(candidate_urls) >= 25:
+                        break
             logger.info(
                 "[repair] suggestions task_id=%s keyword=%s count=%s msg=%s",
                 task_id,

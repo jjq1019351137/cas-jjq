@@ -1155,13 +1155,29 @@ class BaiduAdapter(BaseCloudDriveAdapter):
                 uk = int(uk)
             share_id_num = shared_data.get("shareid")
             bdstoken = shared_data.get("bdstoken", "")
+            if not uk or not share_id_num:
+                return {"code": 1, "message": "分享页解析缺少 uk/shareid，可能触发风控或需验证", "data": {}}
 
             # 转存文件
             fs_ids = [int(fid) for fid in fid_token_list if fid and fid.isdigit()]
+            if not fs_ids:
+                return {"code": 1, "message": "转存失败: fid_token 均非数字 fs_id，无法提交转存", "data": {}}
 
             result = self._api_transfer_shared_paths(
                 remote_dir, fs_ids, uk, share_id_num, bdstoken, share_url
             )
+            if result.get("errno") == 2:
+                logger.warning("[Baidu][share/transfer] errno=2，重建分享会话后重试 dest=%s", remote_dir)
+                self._share_session = None
+                self._api_access_shared(share_url, passcode)
+                shared_data = self._api_shared_paths(share_url)
+                retry_uk = shared_data.get("share_uk") or shared_data.get("uk")
+                retry_share_id = shared_data.get("shareid")
+                retry_bdstoken = shared_data.get("bdstoken", "")
+                if retry_uk and retry_share_id:
+                    result = self._api_transfer_shared_paths(
+                        remote_dir, fs_ids, int(retry_uk), retry_share_id, retry_bdstoken, share_url
+                    )
 
             saved_fids = self.align_saved_fids_from_dir(
                 to_pdir_fid if to_pdir_fid else "0",

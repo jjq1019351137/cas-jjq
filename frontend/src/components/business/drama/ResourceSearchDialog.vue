@@ -341,9 +341,9 @@ watch(
       <div class="absolute inset-0 bg-black/60" @click="close" />
 
       <!-- Panel -->
-      <div class="relative z-10 flex h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-2xl">
+      <div class="modal-surface relative z-10 flex h-[85vh] w-full max-w-3xl flex-col overflow-hidden">
         <!-- Header -->
-        <div class="flex items-center justify-between border-b border-[hsl(var(--border))] px-4 py-3 sm:px-5">
+        <div class="modal-bar flex items-center justify-between border-b border-[hsl(var(--border))] px-4 py-3 sm:px-5">
           <div class="flex items-center gap-2">
             <Search class="h-4 w-4 text-[hsl(var(--primary))]" />
             <h2 class="text-base font-semibold text-[hsl(var(--card-foreground))]">资源搜索</h2>
@@ -353,7 +353,7 @@ watch(
             </span>
           </div>
           <button
-            class="flex h-8 w-8 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
+            class="icon-action h-8 w-8"
             @click="close"
           >
             <X class="h-4.5 w-4.5" />
@@ -361,7 +361,7 @@ watch(
         </div>
 
         <!-- Search bar -->
-        <div class="border-b border-[hsl(var(--border))] px-4 py-3 sm:px-5">
+        <div class="modal-bar border-b border-[hsl(var(--border))] px-4 py-3 sm:px-5">
           <div class="flex items-center gap-2">
             <div class="relative flex-1">
               <Input
@@ -529,7 +529,7 @@ watch(
         </div>
 
         <!-- Footer -->
-        <div class="flex items-center justify-between border-t border-[hsl(var(--border))] px-4 py-2.5 text-xs text-[hsl(var(--muted-foreground))] sm:px-5">
+        <div class="modal-bar flex items-center justify-between border-t border-[hsl(var(--border))] px-4 py-2.5 text-xs text-[hsl(var(--muted-foreground))] sm:px-5">
           <span>共 {{ stats.total }} 条结果，点击条目填入分享链接</span>
           <Button size="sm" variant="ghost" @click="close">关闭</Button>
         </div>

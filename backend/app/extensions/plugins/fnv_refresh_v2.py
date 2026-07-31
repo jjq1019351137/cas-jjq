@@ -60,6 +60,8 @@ class Fnv_refresh_v2:
         self.app_name = "trimemedia-web"
         self._discovery_attempted = False
         self._login_attempted = False
+        # 最近一次签名的明细，接口返回 invalid sign 时随告警日志一并输出，便于定位
+        self._last_sign_debug: dict[str, Any] = {}
 
         for key, value in self.default_config.items():
             setattr(self, key, kwargs.get(key, value))
@@ -73,6 +75,17 @@ class Fnv_refresh_v2:
             return
 
         self.is_active = self._bootstrap_runtime_auth(force=False)
+        logger.info(
+            "%s: 配置状态 endpoint=%s mount_quark=%s secret=%s api_key=%s fnv_token=%s token=%s long_token=%s",
+            self.plugin_name,
+            self.endpoint,
+            self.mount_quark,
+            self._mask(self.secret),
+            self._mask(self.api_key),
+            self._mask(self.fnv_token),
+            self._mask(self.token),
+            self._mask(self.long_token),
+        )
         if self.is_active:
             logger.info("%s: 插件已激活", self.plugin_name)
         else:
@@ -117,12 +130,19 @@ class Fnv_refresh_v2:
 
     def _extract_signing_keys(self) -> None:
         if self.secret and self.api_key:
+            logger.debug(
+                "%s: 已配置签名信息，跳过自动提取 secret=%s api_key=%s",
+                self.plugin_name,
+                self._mask(self.secret),
+                self._mask(self.api_key),
+            )
             return
         try:
             js_files = self._discover_js_files()
         except Exception as exc:
             logger.warning("%s: 获取前端入口 JS 失败 %s", self.plugin_name, exc)
             return
+        logger.debug("%s: 发现入口 JS %s 个: %s", self.plugin_name, len(js_files), js_files)
 
         for js_url in js_files:
             try:
@@ -132,8 +152,12 @@ class Fnv_refresh_v2:
                 continue
             if not self.secret:
                 self.secret = self._extract_secret(js_text) or self.secret
+                if self.secret:
+                    logger.info("%s: 从 %s 提取到 secret=%s", self.plugin_name, js_url, self._mask(self.secret))
             if not self.api_key:
                 self.api_key = self._extract_api_key(js_text) or self.api_key
+                if self.api_key:
+                    logger.info("%s: 从 %s 提取到 api_key=%s", self.plugin_name, js_url, self._mask(self.api_key))
             if self.secret and self.api_key:
                 return
 
@@ -152,8 +176,12 @@ class Fnv_refresh_v2:
                     continue
                 if not self.secret:
                     self.secret = self._extract_secret(chunk_text) or self.secret
+                    if self.secret:
+                        logger.info("%s: 从 chunk %s 提取到 secret=%s", self.plugin_name, chunk_url, self._mask(self.secret))
                 if not self.api_key:
                     self.api_key = self._extract_api_key(chunk_text) or self.api_key
+                    if self.api_key:
+                        logger.info("%s: 从 chunk %s 提取到 api_key=%s", self.plugin_name, chunk_url, self._mask(self.api_key))
                 if self.secret and self.api_key:
                     return
 
@@ -234,20 +262,34 @@ class Fnv_refresh_v2:
 
         url = f"{self.endpoint.rstrip('/')}{rel_url}"
         headers = self._build_headers(method=method, rel_url=rel_url, params=params, data=data)
+        body_text = self._serialize_data(data if data is not None else {})
+        logger.debug(
+            "%s: 发起请求 %s %s params=%s body=%s authx=%s",
+            self.plugin_name,
+            method.upper(),
+            rel_url,
+            params,
+            body_text,
+            headers.get("authx", "<无签名>"),
+        )
         try:
             response = self.session.request(
                 method.upper(),
                 url,
                 headers=headers,
                 params=params,
-                data=self._serialize_data(data if data is not None else {}).encode("utf-8"),
+                data=body_text.encode("utf-8"),
                 timeout=5,
             )
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
             if not quiet:
-                logger.warning("%s: 请求失败 %s %s", self.plugin_name, rel_url, exc)
+                body_preview = ""
+                resp = locals().get("response")
+                if resp is not None:
+                    body_preview = f" http_status={resp.status_code} 响应体={resp.text[:300]}"
+                logger.warning("%s: 请求失败 %s %s%s", self.plugin_name, rel_url, exc, body_preview)
             if retry_auth and self.username and self.password and self._bootstrap_runtime_auth(force=True):
                 return self._request(
                     method,
@@ -279,12 +321,19 @@ class Fnv_refresh_v2:
             return payload
 
         if payload.get("code") not in (0, None) and not quiet:
+            message = self._payload_message(payload)
             logger.warning(
                 "%s: 接口返回异常 %s %s",
                 self.plugin_name,
                 rel_url,
-                self._payload_message(payload),
+                message,
             )
+            if "sign" in message.lower():
+                logger.warning(
+                    "%s: 签名被拒，本次签名明细 %s",
+                    self.plugin_name,
+                    json.dumps(self._last_sign_debug, ensure_ascii=False),
+                )
         return payload
 
     def _build_headers(
@@ -301,8 +350,20 @@ class Fnv_refresh_v2:
         }
         if self.fnv_token:
             headers["Authorization"] = self.fnv_token
-        if self._needs_signature(rel_url, method) and self.secret and self.api_key:
+        needs_sign = self._needs_signature(rel_url, method)
+        if needs_sign and self.secret and self.api_key:
             headers["authx"] = self._cse_sign(method, rel_url, params=params, data=data)
+        elif needs_sign:
+            # 需要签名但缺少密钥，后端大概率返回 invalid sign，明确提示缺什么
+            missing = [name for name, val in (("secret", self.secret), ("api_key", self.api_key)) if not val]
+            logger.warning(
+                "%s: %s 需要签名但缺少 %s，未携带 authx，接口大概率报 invalid sign",
+                self.plugin_name,
+                rel_url,
+                "/".join(missing),
+            )
+        else:
+            logger.debug("%s: %s 在免签名名单，不携带 authx", self.plugin_name, rel_url)
         return headers
 
     def _cookie_headers(self) -> dict[str, str]:
@@ -319,6 +380,12 @@ class Fnv_refresh_v2:
         payload = self._request("GET", f"{self.API_PREFIX}/mdb/list")
         libraries = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(libraries, list) or not libraries:
+            logger.warning(
+                "%s: 获取媒体库列表失败或为空 code=%s msg=%s",
+                self.plugin_name,
+                payload.get("code") if isinstance(payload, dict) else None,
+                self._payload_message(payload),
+            )
             return None
 
         if len(libraries) == 1:
@@ -342,7 +409,17 @@ class Fnv_refresh_v2:
             f"{self.API_PREFIX}/mdb/scan/{library_id}",
             data={"dir_list": [target_path]},
         )
-        return bool(payload and payload.get("code") == 0)
+        ok = bool(payload and payload.get("code") == 0)
+        if not ok:
+            logger.warning(
+                "%s: 触发扫描失败 library_id=%s path=%s code=%s msg=%s",
+                self.plugin_name,
+                library_id,
+                target_path,
+                payload.get("code") if isinstance(payload, dict) else None,
+                self._payload_message(payload),
+            )
+        return ok
 
     def _remove_useless(self) -> None:
         wait_time = self.remove_useless_wait
@@ -417,7 +494,22 @@ class Fnv_refresh_v2:
         nonce = str(random.randint(100000, 999999))
         timestamp = str(int(time.time() * 1000))
         body_hash = self._build_body_hash(method, data=data, params=params)
-        sign = self._md5("_".join([self.secret, path, nonce, timestamp, body_hash, self.api_key]))
+        sign_source = "_".join([self.secret, path, nonce, timestamp, body_hash, self.api_key])
+        sign = self._md5(sign_source)
+        # 留存签名明细（密钥打码），接口返回 invalid sign 时随告警一并输出
+        self._last_sign_debug = {
+            "method": method.upper(),
+            "path": path,
+            "nonce": nonce,
+            "timestamp": timestamp,
+            "body_hash": body_hash,
+            "secret": self._mask(self.secret),
+            "api_key": self._mask(self.api_key),
+            "sign": sign,
+            "params": params,
+            "body": self._serialize_data(data),
+        }
+        logger.debug("%s: 生成签名 %s", self.plugin_name, json.dumps(self._last_sign_debug, ensure_ascii=False))
         return f"nonce={nonce}&timestamp={timestamp}&sign={sign}"
 
     def _build_body_hash(
@@ -523,6 +615,16 @@ class Fnv_refresh_v2:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _mask(value: Any) -> str:
+        """敏感值打码：保留首尾各 4 位，便于比对是否配错而不泄露完整密钥"""
+        text = str(value or "")
+        if not text:
+            return "<空>"
+        if len(text) <= 8:
+            return f"{text[:2]}***(len={len(text)})"
+        return f"{text[:4]}...{text[-4:]}(len={len(text)})"
 
     @staticmethod
     def _sha256(value: str) -> str:

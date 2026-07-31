@@ -17,6 +17,7 @@ from app.schemas.task_browse import SharePreviewBatchIn, SharePreviewBatchItemOu
 from app.services.resource_search import fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
 from app.services.title_match import extract_progress, title_matches_names
+from app.services.title_vector_match import is_vector_fallback_enabled, vector_recall
 from app.services.tmdb_cache import get_tmdb_detail_cached
 
 logger = logging.getLogger(__name__)
@@ -316,9 +317,11 @@ def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str,
         "skip_tmdb_mismatch": 0,
         "kept": 0,
         "limit_reached": False,
+        "vector_fallback": [],
     }
     filtered: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
+    mismatch_pool: list[dict[str, Any]] = []
     for item in all_items:
         shareurl = str(item.get("shareurl") or "").strip()
         if not shareurl or shareurl in seen_urls:
@@ -340,6 +343,7 @@ def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str,
         title = str(item.get("taskname") or item.get("content") or "").strip()
         if not _title_matches_tmdb_names(title, names):
             stats["skip_tmdb_mismatch"] = int(stats.get("skip_tmdb_mismatch") or 0) + 1
+            mismatch_pool.append(item)
             continue
         seen_urls.add(shareurl)
         filtered.append(item)
@@ -347,6 +351,23 @@ def _search_candidates(db: Session, *, names: list[str]) -> tuple[list[dict[str,
         if len(filtered) >= 25:
             stats["limit_reached"] = True
             break
+    if not filtered and mismatch_pool and is_vector_fallback_enabled():
+        pool_titles = [str(x.get("taskname") or x.get("content") or "").strip() for x in mismatch_pool]
+        for index, score in vector_recall(pool_titles, names):
+            item = mismatch_pool[index]
+            shareurl = str(item.get("shareurl") or "").strip()
+            if not shareurl or shareurl in seen_urls:
+                continue
+            seen_urls.add(shareurl)
+            filtered.append(item)
+            stats["vector_fallback"].append({"shareurl": shareurl, "taskname": pool_titles[index], "score": round(score, 4)})
+        stats["kept"] = len(filtered)
+        logger.info(
+            "[autoupdate] vector_fallback names=%s pool=%s recalled=%s",
+            names,
+            len(mismatch_pool),
+            len(stats["vector_fallback"]),
+        )
     return filtered, db_changed, stats
 
 
