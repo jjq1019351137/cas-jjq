@@ -26,6 +26,7 @@ class Task(Base):
     account_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     update_subdir: Mapped[str | None] = mapped_column(String(255), nullable=True)
     shareurl_ban: Mapped[str | None] = mapped_column(Text, nullable=True)
+    shareurl_list_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tmdb_media_type: Mapped[str | None] = mapped_column(String(8), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="1")

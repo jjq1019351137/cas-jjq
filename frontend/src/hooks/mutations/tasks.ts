@@ -10,6 +10,8 @@ import {
   syncDramaSavepathSnapshots,
   updateTaskSchedulerSetting,
   runAllDramaTasks,
+  checkTaskShareUrls,
+  activateTaskShareUrl,
 } from '@/api/tasks'
 
 export function useCreateTaskMutation() {
@@ -89,5 +91,21 @@ export function useUpdateSchedulerMutation() {
 export function useRunAllTasksMutation() {
   return useMutation({
     mutationFn: runAllDramaTasks,
+  })
+}
+
+export function useCheckTaskShareUrlsMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, shareurls }: { taskId: number; shareurls?: string[] }) => checkTaskShareUrls(taskId, shareurls),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
+  })
+}
+
+export function useActivateTaskShareUrlMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, shareurl }: { taskId: number; shareurl: string }) => activateTaskShareUrl(taskId, shareurl),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
   })
 }

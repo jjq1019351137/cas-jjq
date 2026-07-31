@@ -20,7 +20,7 @@ class Fnv_refresh_v2:
     API_PREFIX = "/v/api/v1"
     DEFAULT_HEADERS = {
         "X-Trim-Client": "web",
-        "X-Trim-Client-Version": "610",
+        "X-Trim-Client-Version": "616",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -37,7 +37,7 @@ class Fnv_refresh_v2:
     )
 
     default_config = {
-        "tips": "填写 endpoint、mount_quark、secret、fnv_token 后即可启用；token/long_token 可选。",
+        "tips": "填写 endpoint、mount_quark 后即可启用；secret/api_key 可手动指定（自动提取失败时兜底）；token/long_token/fnv_token 可选。",
         "endpoint": "",
         "username": "",
         "password": "",
@@ -46,6 +46,7 @@ class Fnv_refresh_v2:
         "token": "",
         "long_token": "",
         "secret": "",
+        "api_key": "",
         "fnv_token": "",
     }
 
@@ -117,7 +118,7 @@ class Fnv_refresh_v2:
         if not self.endpoint:
             return False
 
-        if force or ((not self.secret or not self.api_key) and not self._discovery_attempted):
+        if force or not self._discovery_attempted:
             self._discovery_attempted = True
             self._extract_signing_keys()
 
@@ -129,14 +130,18 @@ class Fnv_refresh_v2:
         return bool(self.fnv_token)
 
     def _extract_signing_keys(self) -> None:
-        if self.secret and self.api_key:
+        pre_secret = self.secret
+        pre_api_key = self.api_key
+        if pre_secret and pre_api_key:
             logger.debug(
-                "%s: 已配置签名信息，跳过自动提取 secret=%s api_key=%s",
+                "%s: 已预配签名信息，仍尝试从前端 JS 提取以确保匹配当前部署 secret=%s api_key=%s",
                 self.plugin_name,
-                self._mask(self.secret),
-                self._mask(self.api_key),
+                self._mask(pre_secret),
+                self._mask(pre_api_key),
             )
-            return
+            # 清空以强制提取
+            self.secret = ""
+            self.api_key = ""
         try:
             js_files = self._discover_js_files()
         except Exception as exc:
@@ -144,22 +149,28 @@ class Fnv_refresh_v2:
             return
         logger.debug("%s: 发现入口 JS %s 个: %s", self.plugin_name, len(js_files), js_files)
 
+        extraction_log: list[dict[str, Any]] = []
+
         for js_url in js_files:
             try:
                 js_text = self._fetch_text(js_url)
             except Exception as exc:
                 logger.debug("%s: 读取入口 JS 失败 %s %s", self.plugin_name, js_url, exc)
                 continue
+            file_log: dict[str, Any] = {"url": js_url, "size": len(js_text)}
             if not self.secret:
                 self.secret = self._extract_secret(js_text) or self.secret
+                file_log["secret"] = bool(self.secret)
                 if self.secret:
                     logger.info("%s: 从 %s 提取到 secret=%s", self.plugin_name, js_url, self._mask(self.secret))
             if not self.api_key:
                 self.api_key = self._extract_api_key(js_text) or self.api_key
+                file_log["api_key"] = bool(self.api_key)
                 if self.api_key:
                     logger.info("%s: 从 %s 提取到 api_key=%s", self.plugin_name, js_url, self._mask(self.api_key))
             if self.secret and self.api_key:
                 return
+            extraction_log.append(file_log)
 
         for js_url in js_files:
             try:
@@ -174,16 +185,20 @@ class Fnv_refresh_v2:
                 except Exception as exc:
                     logger.debug("%s: 读取 chunk 失败 %s %s", self.plugin_name, chunk_url, exc)
                     continue
+                chunk_log: dict[str, Any] = {"url": chunk_url, "size": len(chunk_text)}
                 if not self.secret:
                     self.secret = self._extract_secret(chunk_text) or self.secret
+                    chunk_log["secret"] = bool(self.secret)
                     if self.secret:
                         logger.info("%s: 从 chunk %s 提取到 secret=%s", self.plugin_name, chunk_url, self._mask(self.secret))
                 if not self.api_key:
                     self.api_key = self._extract_api_key(chunk_text) or self.api_key
+                    chunk_log["api_key"] = bool(self.api_key)
                     if self.api_key:
                         logger.info("%s: 从 chunk %s 提取到 api_key=%s", self.plugin_name, chunk_url, self._mask(self.api_key))
                 if self.secret and self.api_key:
                     return
+                extraction_log.append(chunk_log)
 
         missing = []
         if not self.secret:
@@ -191,7 +206,23 @@ class Fnv_refresh_v2:
         if not self.api_key:
             missing.append("api_key")
         if missing:
-            logger.warning("%s: 自动提取签名信息失败，缺少 %s", self.plugin_name, "/".join(missing))
+            scanned_files = [e["url"].rsplit("/", 1)[-1] for e in extraction_log]
+            logger.warning(
+                "%s: 自动提取签名信息失败，缺少 %s。已扫描 %d 个 JS 文件: %s。"
+                "前端代码结构可能因版本/部署不同而变化，请在配置中手动指定 secret 和 api_key。",
+                self.plugin_name,
+                "/".join(missing),
+                len(extraction_log),
+                scanned_files[:5],
+            )
+
+        # 提取失败时，用预配置值兜底
+        if not self.secret and pre_secret:
+            self.secret = pre_secret
+            logger.info("%s: secret 提取失败，回退使用预配置值 %s", self.plugin_name, self._mask(self.secret))
+        if not self.api_key and pre_api_key:
+            self.api_key = pre_api_key
+            logger.info("%s: api_key 提取失败，回退使用预配置值 %s", self.plugin_name, self._mask(self.api_key))
 
     def _discover_js_files(self) -> list[str]:
         html = self._fetch_text(f"{self.endpoint}/v/")
@@ -496,7 +527,6 @@ class Fnv_refresh_v2:
         body_hash = self._build_body_hash(method, data=data, params=params)
         sign_source = "_".join([self.secret, path, nonce, timestamp, body_hash, self.api_key])
         sign = self._md5(sign_source)
-        # 留存签名明细（密钥打码），接口返回 invalid sign 时随告警一并输出
         self._last_sign_debug = {
             "method": method.upper(),
             "path": path,
@@ -567,27 +597,72 @@ class Fnv_refresh_v2:
 
     @staticmethod
     def _extract_secret(js_text: str) -> str | None:
-        match = re.search(
+        patterns = [
+            r'\[\s*`([A-Za-z0-9+/=]{20,50})`\s*'
+            r'(?:,\s*[a-zA-Z_$][\w$]*\s*){5}'
+            r'\]\s*\.join\s*\(\s*`_`\s*\)',
+            r'\[\s*`([A-Za-z0-9+/=]{20,50})`\s*'
+            r'(?:,\s*[a-zA-Z_$][\w$]*\s*){5}'
+            r'\]\s*\.join\s*\(\s*["\']_["\']',
+            r'\[\s*["\']([A-Za-z0-9+/=]{20,50})["\']\s*'
+            r'(?:,\s*[a-zA-Z_$][\w$]*\s*){5}'
+            r'\]\s*\.join',
             r'\[`([A-Za-z0-9+/=]{20,50})`,\s*r,\s*s,\s*c,\s*o,\s*t\]\.join',
-            js_text,
-        )
-        return match.group(1) if match else None
+        ]
+        for i, pat in enumerate(patterns):
+            match = re.search(pat, js_text)
+            if match:
+                logger.debug("_extract_secret: 策略 %d 命中", i + 1)
+                return match.group(1)
+        return None
 
     @staticmethod
     def _extract_api_key(js_text: str) -> str | None:
-        match = re.search(
-            r'new\s+Uint8Array\(\[([\d,\s]+)\]\).*?t\[n\]=e\[n\]\^(\d+)',
-            js_text,
-            re.DOTALL,
-        )
-        if not match:
-            return None
-        try:
-            byte_values = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
-            xor_key = int(match.group(2))
-            return bytes(value ^ xor_key for value in byte_values).decode("utf-8")
-        except Exception:
-            return None
+        strategies: list[tuple[str, re.Pattern]] = [
+            (
+                "Uint8Array+XOR+TextDecoder",
+                re.compile(
+                    r'new\s+Uint8Array\(\s*\[([\d,\s]+)\]\s*\)'
+                    r'.{0,200}?'
+                    r'(\w+)\[\w+\]\s*=\s*(\w+)\[\w+\]\s*\^\s*(\d+)'
+                    r'.{0,100}?'
+                    r'TextDecoder',
+                    re.DOTALL,
+                ),
+            ),
+            (
+                "Uint8Array+XOR-simple",
+                re.compile(
+                    r'new\s+Uint8Array\(\s*\[([\d,\s]+)\]\s*\)'
+                    r'.{0,150}?'
+                    r'\w+\[\w+\]\s*=\s*\w+\[\w+\]\s*\^\s*(\d+)',
+                    re.DOTALL,
+                ),
+            ),
+            (
+                "legacy-t[n]=e[n]^",
+                re.compile(
+                    r'new\s+Uint8Array\(\[([\d,\s]+)\]\).*?t\[n\]=e\[n\]\^(\d+)',
+                    re.DOTALL,
+                ),
+            ),
+        ]
+        for name, pat in strategies:
+            match = pat.search(js_text)
+            if not match:
+                continue
+            groups = match.groups()
+            try:
+                byte_str = groups[0]
+                byte_values = [int(item.strip()) for item in byte_str.split(",") if item.strip()]
+                xor_key = int(groups[-1])
+                decoded = bytes(value ^ xor_key for value in byte_values).decode("utf-8")
+                if decoded and all(32 <= ord(c) < 127 for c in decoded):
+                    logger.debug("_extract_api_key: 策略 %s 命中, xorKey=%d, len=%d", name, xor_key, len(decoded))
+                    return decoded
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def _normalize_endpoint(endpoint: str) -> str:

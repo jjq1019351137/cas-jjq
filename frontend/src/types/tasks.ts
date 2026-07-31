@@ -2,6 +2,35 @@ export type TaskExtraConfig = Record<string, any> & {
   auto_update_115_shareurl?: boolean | null
 }
 
+export type TaskShareUrlItem = {
+  url: string
+  status: 'unknown' | 'ok' | 'invalid' | string
+  reason?: string | null
+  last_checked_at?: string | null
+  added_at?: string | null
+  source?: string | null
+  is_active: boolean
+}
+
+export type TaskShareUrlsCheckItem = {
+  url: string
+  ok: boolean
+  message?: string | null
+  status: string
+  latest_video?: {
+    fid?: string | null
+    name?: string | null
+    updated_at?: any | null
+    size?: number | null
+    season?: number | null
+    episode?: number | null
+  } | null
+}
+
+export type TaskShareUrlsCheckResponse = {
+  items: TaskShareUrlsCheckItem[]
+}
+
 export type TaskExecutionItem = {
   id: number
   task_id: number
@@ -33,6 +62,7 @@ export type TaskItem = {
   account_name?: string | null
   update_subdir?: string | null
   shareurl_ban?: string | null
+  shareurls?: TaskShareUrlItem[]
   tmdb_id?: number | null
   tmdb_media_type?: string | null
   tmdb_status?: string | null

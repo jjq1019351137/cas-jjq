@@ -241,6 +241,9 @@ function saveScheduler() {
 
 // --- Per-task actions ---
 function buildRunOncePayloadFromTask(task: TaskItem) {
+  const shareurls = (task.shareurls || [])
+    .map((x) => String(x.url || '').trim())
+    .filter(Boolean)
   return {
     // 带上 task_uid 后端才能关联到真实任务行：
     // 失败时写入 shareurl_ban 并触发自动修复，成功时触发115自动换链
@@ -248,6 +251,7 @@ function buildRunOncePayloadFromTask(task: TaskItem) {
     task_type: task.task_type,
     taskname: String(task.taskname || '').trim(),
     shareurl: String(task.shareurl || '').trim(),
+    shareurls,
     savepath: String(task.savepath || '').trim(),
     sync_task_uids: [...(task.sync_task_uids || [])],
     pattern: task.pattern ?? null,

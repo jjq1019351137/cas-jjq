@@ -21,7 +21,13 @@ from app.services.invalid_share_links import list_invalid_shareurls
 from app.services.drama_share_autoupdate import resolve_drama_shareurl_update
 from app.services.resource_search import fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
-from app.services.title_match import extract_progress, title_matches_names
+from app.services.task_share_links import (
+    STATUS_INVALID,
+    load_share_links,
+    mark_link_status,
+    replace_active_link,
+)
+from app.services.title_match import DEFAULT_MATCH_THRESHOLD, extract_progress, title_match_score, title_matches_names
 from app.services.title_vector_match import is_vector_fallback_enabled, vector_recall
 from app.services.tmdb_cache import get_tmdb_detail_cached
 
@@ -143,6 +149,78 @@ def _pick_drive_type(db: Session, task: Task) -> str | None:
     return None if not dt2 else str(dt2)
 
 
+def _try_activate_backup_link(db: Session, task: Task, *, debug: bool) -> tuple[dict | None, bool]:
+    """优先启用任务自身的健康备用链接（零外部搜索成本）；返回 (repaired_item, db_changed)。"""
+    task_id = int(getattr(task, "id", 0) or 0)
+    taskname = str(getattr(task, "taskname", "") or "")
+    old_shareurl = str(getattr(task, "shareurl", "") or "").strip()
+    ban = str(getattr(task, "shareurl_ban", "") or "").strip()
+    db_changed = False
+
+    backups = [x for x in load_share_links(task) if x["url"] != old_shareurl and x["status"] != STATUS_INVALID]
+    if not backups:
+        return (None, False)
+    urls = [x["url"] for x in backups]
+    logger.info("[repair] try_backup task_id=%s candidates=%s", task_id, len(urls))
+    batch_out, batch_changed = preview_share_batch(db, SharePreviewBatchIn(shareurls=urls, account_name=None))
+    if batch_changed:
+        db_changed = True
+
+    best = None
+    best_key = None
+    for row in batch_out.items or []:
+        url = str(getattr(row, "shareurl", "") or "").strip()
+        if not bool(getattr(row, "ok", False)):
+            if mark_link_status(db, task_id, url, status=STATUS_INVALID, reason=str(getattr(row, "message", "") or "").strip() or None):
+                db_changed = True
+            continue
+        latest = getattr(row, "latest_video", None)
+        season = _latest_get(latest, "season") if latest is not None else None
+        episode = _latest_get(latest, "episode") if latest is not None else None
+        size = _latest_get(latest, "size") if latest is not None else None
+        key = (
+            1 if episode is not None else 0,
+            int(season or 0),
+            int(episode or 0),
+            int(size or 0),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best = row
+    if best is None:
+        logger.info("[repair] try_backup task_id=%s no_usable_backup", task_id)
+        return (None, db_changed)
+
+    backup_url = str(best.shareurl or "").strip()
+    new_shareurl = _rewrite_shareurl_with_fid(backup_url, str(getattr(best, "resolved_pdir_fid", None) or ""))
+    replace_active_link(
+        db,
+        task,
+        new_shareurl,
+        replace_url=backup_url if backup_url != new_shareurl else None,
+        mark_old_invalid=True,
+        old_reason=ban or "分享链接失效",
+        source="repair",
+    )
+    db_changed = True
+    latest = best.latest_video
+    if debug:
+        logger.debug(f"[repair] task_id={task_id} backup_activated new_shareurl={new_shareurl}")
+    logger.info("[repair] repaired_by_backup task_id=%s name=%s old=%s new=%s", task_id, taskname, old_shareurl, new_shareurl)
+    item = {
+        "task_id": task_id,
+        "taskname": taskname,
+        "drive_type": _pick_drive_type(db, task),
+        "old_shareurl": old_shareurl,
+        "new_shareurl": new_shareurl,
+        "season": _latest_get(latest, "season") if latest is not None else None,
+        "episode": _latest_get(latest, "episode") if latest is not None else None,
+        "size": _latest_get(latest, "size") if latest is not None else None,
+        "used_backup": True,
+    }
+    return (item, db_changed)
+
+
 def repair_banned_drama_tasks(
     db: Session,
     *,
@@ -220,6 +298,12 @@ def repair_banned_drama_tasks(
                 drive_type,
                 str(getattr(task, "shareurl_ban", "") or "").strip(),
             )
+            backup_item, backup_changed = _try_activate_backup_link(db, task, debug=debug)
+            if backup_changed:
+                db_changed = True
+            if backup_item is not None:
+                repaired.append(backup_item)
+                continue
             if str(drive_type) == "115":
                 update_result = resolve_drama_shareurl_update(db, task, respect_toggle=False)
                 if bool(update_result.get("db_changed")):
@@ -307,7 +391,9 @@ def repair_banned_drama_tasks(
                                 f"[repair] task_id={task_id} skip_candidate reason=title_mismatch title={title} names={match_names}"
                             )
                         removed_title_mismatch += 1
-                        mismatch_pool.append({"shareurl": url, "taskname": title})
+                        mismatch_pool.append(
+                            {"shareurl": url, "taskname": title, "score": title_match_score(title, match_names)}
+                        )
                         continue
                     seen.add(url)
                     candidate_urls.append(url)
@@ -357,6 +443,21 @@ def repair_banned_drama_tasks(
                     removed_empty,
                     removed_title_mismatch,
                 )
+                # 标题否决是修复失败的最常见原因，把被否决的标题与匹配分升到 WARNING，
+                # 否则只能看到 removed_title_mismatch 计数，无法判断否决是否正确
+                if mismatch_pool:
+                    logger.warning(
+                        "[repair] task_id=%s name=%s 全部候选被标题否决 names=%s threshold=%s vector_fallback=%s rejected=%s",
+                        task_id,
+                        taskname,
+                        match_names,
+                        DEFAULT_MATCH_THRESHOLD,
+                        "on" if is_vector_fallback_enabled() else "off(DRAMA_VECTOR_FALLBACK)",
+                        " | ".join(
+                            f"{round(float(x.get('score') or 0.0), 3)}:{str(x.get('taskname') or '')[:60]}"
+                            for x in mismatch_pool[:10]
+                        ),
+                    )
                 continue
             if debug:
                 logger.debug(f"[repair] task_id={task_id} candidate_urls={candidate_urls}")
@@ -434,9 +535,16 @@ def repair_banned_drama_tasks(
             new_shareurl = _rewrite_shareurl_with_fid(str(best.shareurl or ""), str(getattr(best, "resolved_pdir_fid", None) or ""))
             if debug:
                 logger.debug(f"[repair] task_id={task_id} picked best_key={best_key} new_shareurl={new_shareurl}")
-            task.shareurl = new_shareurl
-            task.shareurl_ban = None
-            db.flush()
+            ban_reason = str(getattr(task, "shareurl_ban", "") or "").strip()
+            replace_active_link(
+                db,
+                task,
+                new_shareurl,
+                replace_url=str(best.shareurl or "").strip() if str(best.shareurl or "").strip() != new_shareurl else None,
+                mark_old_invalid=True,
+                old_reason=ban_reason or "分享链接失效",
+                source="repair",
+            )
             db_changed = True
             logger.info("[repair] repaired task_id=%s name=%s old=%s new=%s", task_id, taskname, old_shareurl, new_shareurl)
 
@@ -479,7 +587,8 @@ def repair_banned_drama_tasks(
             se = f"S{int(s):02d}E{int(e):02d}"
         size = item.get("size")
         size_text = f" size={int(size)}" if size is not None else ""
-        lines.append(f"✅《{item.get('taskname')}》 {se}{size_text}\n{item.get('new_shareurl')}")
+        backup_text = "（启用备用链接）" if item.get("used_backup") else ""
+        lines.append(f"✅《{item.get('taskname')}》 {se}{size_text}{backup_text}\n{item.get('new_shareurl')}")
     content = "🔧自动修复封禁分享链接：\n\n" + "\n\n".join(lines)
     try:
         send_runtime(db, DRAMA_NOTIFY_TITLE, content)

@@ -28,6 +28,17 @@ from app.services import audit
 from app.services.drama_share_autoupdate import is_115_auto_update_task, resolve_drama_shareurl_update
 from app.services.drive_account_lsdir_scan import trigger_drive_account_lsdir_targeted_scan
 from app.services.system_settings import get_save_rule_runtime_config
+from app.services.task_share_links import (
+    STATUS_INVALID,
+    STATUS_OK,
+    load_share_links,
+    mark_link_status,
+    pick_run_link_candidates,
+)
+
+
+# 分享链接相关阶段：这些阶段失败才把链接标为失效；全部链接失败才写入 shareurl_ban
+SHARE_LINK_STAGES = {"share_parse", "get_stoken", "fetch_share_items"}
 
 
 logger = logging.getLogger(__name__)
@@ -196,6 +207,7 @@ class TaskExecutor:
             'addition': json.loads(task.addition_json) if task.addition_json else {},
             'extra': json.loads(task.extra_json) if task.extra_json else {},
             'transferred_history': _safe_json_list(getattr(task, "transferred_history_json", None)),
+            'shareurls': [x["url"] for x in load_share_links(task)],
         }
 
     def _persist_transferred_history(self, *, task: Task, tree: Tree) -> None:
@@ -280,6 +292,118 @@ class TaskExecutor:
         except Exception:
             pass
         return tree
+
+    def _execute_drama_all_links(
+        self,
+        *,
+        task: Task,
+        task_data: dict[str, Any],
+        adapter: Any,
+        log: ExecutionLog,
+        persist_execution: bool,
+    ) -> Tree:
+        task_id = int(getattr(task, "id", 0) or 0)
+        persist_links = bool(persist_execution and task_id > 0)
+
+        payload_urls = task_data.get("shareurls")
+        if task_id <= 0 and isinstance(payload_urls, list) and payload_urls:
+            candidates = list(dict.fromkeys(str(x or "").strip() for x in payload_urls if str(x or "").strip()))
+        else:
+            candidates = pick_run_link_candidates(task)
+        active_url = str(task_data.get("shareurl") or "").strip()
+        if not candidates:
+            candidates = [active_url] if active_url else []
+        if not candidates:
+            raise bad_request("TASK_SHAREURL_INVALID", "没有可用的分享链接")
+
+        total = len(candidates)
+        
+        original_startfid = str(task_data.get("startfid") or "").strip()
+
+        trees: list[Tree] = []
+        summaries: list[str] = []
+        transfer_total = 0
+        changed_dirs: list[str] = []
+        history_entries: list[Any] = []
+        ok_count = 0
+        last_exc: Exception | None = None
+        last_stage = ""
+        last_message = ""
+
+        for index, url in enumerate(candidates, start=1):
+            task_data["shareurl"] = url
+            task_data["_failover_attempted"] = index
+            is_active_link = bool(active_url) and url == active_url
+            task_data["startfid"] = original_startfid if is_active_link else ""
+            if total > 1:
+                log.set_stage("execute_drama")
+                log.section(f"分享链接 {index}/{total}")
+                log.line(f"链接: {url}")
+                if original_startfid and not is_active_link:
+                    log.line("说明: 非主链接不应用起始文件（startfid 仅对主链接有效）")
+            try:
+                tree = self._execute_drama_task(adapter, task_data, log)
+            except SkipTask:
+                raise
+            except Exception as exc:
+                stage = log.stage or "unknown"
+                message = str(exc).strip() or type(exc).__name__
+                last_exc, last_stage, last_message = exc, stage, message
+                if stage in SHARE_LINK_STAGES and persist_links:
+                    try:
+                        self._write_with_session(
+                            lambda db: mark_link_status(
+                                db, task_id, url, status=STATUS_INVALID, reason=f"阶段={stage}：{message}"
+                            )
+                        )
+                    except Exception:
+                        logger.warning("标记失效链接状态失败 task_id=%s url=%s", task_id, url)
+                log.line(f"FAIL: 阶段={stage} {message}")
+                if index < total:
+                    log.line("继续处理下一条链接")
+                continue
+
+            ok_count += 1
+            trees.append(tree)
+            count = int(getattr(tree, "_transfer_count", 0) or 0)
+            transfer_total += count
+            for item in (getattr(tree, "_changed_relative_dirs", None) or []):
+                if item not in changed_dirs:
+                    changed_dirs.append(item)
+            raw_entries = getattr(tree, "_transferred_history_entries", None)
+            if isinstance(raw_entries, list):
+                history_entries.extend(raw_entries)
+            if total > 1:
+                log.line(f"OK: 本链接新增 {count} 个文件")
+                summaries.append(f"【链接 {index}/{total}】{url}\n{str(tree)}")
+            if persist_links:
+                try:
+                    self._write_with_session(lambda db: mark_link_status(db, task_id, url, status=STATUS_OK))
+                except Exception:
+                    logger.warning("标记可用链接状态失败 task_id=%s url=%s", task_id, url)
+
+        if not trees:
+            log.set_stage(last_stage or "execute_drama")
+            raise last_exc if last_exc is not None else RuntimeError("没有可用的分享链接")
+
+        if total > 1:
+            log.set_stage("execute_drama")
+            log.section("多链接汇总")
+            log.line(f"链接数: {total}  成功: {ok_count}  失败: {total - ok_count}")
+            log.line(f"本次新增文件合计: {transfer_total}")
+            if last_message and ok_count < total:
+                log.line(f"最后一条失败原因: 阶段={last_stage} {last_message}")
+
+        # 以首个成功的 tree 为载体，合并全部链接的结果，
+        # 使下游（插件触发、通知、lsdir 定向刷新、联动同步、转存历史）拿到的是汇总结果
+        merged = trees[0]
+        setattr(merged, "_transfer_count", transfer_total)
+        setattr(merged, "_changed_relative_dirs", changed_dirs)
+        if history_entries:
+            setattr(merged, "_transferred_history_entries", history_entries)
+        if len(summaries) > 1:
+            setattr(merged, "_combined_summary", "\n\n".join(summaries))
+        return merged
 
     def run_task(
         self,
@@ -618,7 +742,13 @@ class TaskExecutor:
             if task_data.get('task_type') == 'drama':
                 log.set_stage("execute_drama")
                 log.section("转存任务")
-                tree = self._execute_drama_task(adapter, task_data, log)
+                tree = self._execute_drama_all_links(
+                    task=task,
+                    task_data=task_data,
+                    adapter=adapter,
+                    log=log,
+                    persist_execution=persist_execution,
+                )
                 self._persist_transferred_history(task=task, tree=tree)
             else:
                 log.set_stage("execute_generic")
@@ -794,7 +924,7 @@ class TaskExecutor:
             payload = ExecutionPayload(
                 status='success',
                 message='执行完成',
-                tree_summary=str(tree),
+                tree_summary=str(getattr(tree, "_combined_summary", None) or tree),
                 stage=log.stage,
                 run_log=log.render(),
                 adapter_snapshot={
@@ -839,12 +969,15 @@ class TaskExecutor:
             if (
                 status == "failed"
                 and str(getattr(task, "task_type", "") or "") == "drama"
-                and stage in {"share_parse", "get_stoken", "fetch_share_items"}
+                and stage in SHARE_LINK_STAGES
                 and not str(getattr(task, "shareurl_ban", "") or "").strip()
             ):
                 if persist_execution and task_id > 0:
+                    attempted = int(task_data.get("_failover_attempted") or 0)
+                    ban_suffix = f"（已尝试 {attempted} 个链接）" if attempted > 1 else ""
+                    ban_text = f"阶段={stage}：{message}{ban_suffix}"
                     self._write_with_session(
-                        lambda db: setattr(db.get(Task, task_id), "shareurl_ban", f"阶段={stage}：{message}")
+                        lambda db: setattr(db.get(Task, task_id), "shareurl_ban", ban_text)
                         if db.get(Task, task_id) is not None
                         else None
                     )

@@ -3,11 +3,22 @@ import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
-import { Search, Loader2, X, History, Trash2, CheckCircle2, XCircle, HelpCircle } from 'lucide-vue-next'
+import { Search, Loader2, X, History, Trash2, CheckCircle2, XCircle, HelpCircle, Eye, Square, CheckSquare } from 'lucide-vue-next'
 import { previewShare } from '@/api/tasks'
 import { fetchTaskSuggestions, verifyTaskSuggestions } from '@/api/resourceSearch'
 import { RESOURCE_SEARCH_SOURCE_LABELS, type TaskSuggestionItem } from '@/types/resourceSearch'
 import { detectDriveTypeByUrl, getDriveTypeLabel } from '@/utils/driveType'
+import SharePreviewDialog, { type SharePreviewContext } from '@/components/business/drama/SharePreviewDialog.vue'
+
+/** 多选模式下的底部动作按钮定义 */
+export interface ResourceSearchAction {
+  key: string
+  label: string
+  /** 最少选中数（默认 1） */
+  min?: number
+  /** 最多选中数（不传不限） */
+  max?: number
+}
 
 interface Props {
   visible: boolean
@@ -16,17 +27,27 @@ interface Props {
   driveType?: string | null
   /** 待选网盘类型集合（已有账号类型），driveType 为空时用于限定搜索范围 */
   driveTypes?: string[] | null
+  /** 多选模式：行勾选 + 底部 actions 按钮；默认 false 保持单选点选即回填 */
+  multiSelect?: boolean
+  /** 多选模式底部动作按钮 */
+  actions?: ResourceSearchAction[] | null
+  /** 逐条只读预览的重命名上下文（pattern/replace 等） */
+  previewContext?: SharePreviewContext | null
 }
 
 const props = withDefaults(defineProps<Props>(), {
   initialQuery: '',
   driveType: null,
   driveTypes: null,
+  multiSelect: false,
+  actions: null,
+  previewContext: null,
 })
 
 const emit = defineEmits<{
   'update:visible': [val: boolean]
   select: [item: TaskSuggestionItem]
+  action: [key: string, items: TaskSuggestionItem[]]
 }>()
 
 // ===== State =====
@@ -51,6 +72,47 @@ const selectedSource = ref<string>('all')
 const selectedDrive = ref<string>('all')
 const visibleCount = ref(PAGE_SIZE)
 const history = ref<string[]>(loadHistory())
+
+// 多选状态（按 shareurl 去重）
+const selectedUrls = ref<Set<string>>(new Set())
+const selectedItems = computed(() =>
+  search.items.filter((x) => x.shareurl && selectedUrls.value.has(x.shareurl)),
+)
+
+function isSelected(item: TaskSuggestionItem): boolean {
+  return Boolean(item.shareurl && selectedUrls.value.has(item.shareurl))
+}
+
+function toggleSelect(item: TaskSuggestionItem) {
+  if (!item.shareurl || item.verify === false) return
+  const next = new Set(selectedUrls.value)
+  if (next.has(item.shareurl)) next.delete(item.shareurl)
+  else next.add(item.shareurl)
+  selectedUrls.value = next
+}
+
+function actionDisabled(action: ResourceSearchAction): boolean {
+  const n = selectedItems.value.length
+  if (n < Math.max(1, action.min ?? 1)) return true
+  if (action.max != null && n > action.max) return true
+  return false
+}
+
+function runAction(action: ResourceSearchAction) {
+  if (actionDisabled(action)) return
+  emit('action', action.key, selectedItems.value.slice())
+  close()
+}
+
+// 逐条只读预览
+const previewVisible = ref(false)
+const previewUrl = ref('')
+
+function openItemPreview(item: TaskSuggestionItem) {
+  if (!item.shareurl) return
+  previewUrl.value = item.shareurl
+  previewVisible.value = true
+}
 
 // 按分享链接缓存网盘类型，避免 computed 中重复正则探测
 const driveTypeCache = new Map<string, string>()
@@ -283,6 +345,10 @@ function markLargestAndSort(items: TaskSuggestionItem[]) {
 
 // ===== Interaction =====
 function selectItem(item: TaskSuggestionItem) {
+  if (props.multiSelect) {
+    toggleSelect(item)
+    return
+  }
   emit('select', item)
   close()
 }
@@ -321,6 +387,8 @@ watch(
       selectedSource.value = 'all'
       selectedDrive.value = 'all'
       visibleCount.value = PAGE_SIZE
+      selectedUrls.value = new Set()
+      previewVisible.value = false
       history.value = loadHistory()
       nextTick(() => {
         if (query.value.length >= 2) doSearch(0)
@@ -329,6 +397,7 @@ watch(
       search.runId += 1
       search.loading = false
       search.verifying = false
+      previewVisible.value = false
     }
   },
 )
@@ -348,6 +417,7 @@ watch(
             <Search class="h-4 w-4 text-[hsl(var(--primary))]" />
             <h2 class="text-base font-semibold text-[hsl(var(--card-foreground))]">资源搜索</h2>
             <Badge v-if="scopeHint" variant="outline" class="text-[10px]">{{ scopeHint }}</Badge>
+            <Badge v-if="multiSelect && selectedItems.length" variant="outline" class="border-[hsl(var(--primary))] text-[10px] text-[hsl(var(--primary))]">已选 {{ selectedItems.length }} 项</Badge>
             <span v-if="search.verifying" class="inline-flex items-center gap-1 text-xs text-[hsl(var(--muted-foreground))]">
               <Loader2 class="h-3 w-3 animate-spin" /> 正在检查链接有效性...
             </span>
@@ -489,12 +559,22 @@ watch(
             <div
               v-for="(item, idx) in displayItems"
               :key="`${item.shareurl}-${idx}`"
-              class="cursor-pointer border-b border-[hsl(var(--border))] px-4 py-2.5 transition-colors last:border-0 hover:bg-[hsl(var(--accent))] sm:px-5"
+              class="border-b border-[hsl(var(--border))] px-4 py-2.5 transition-colors last:border-0 hover:bg-[hsl(var(--accent))] sm:px-5"
+              :class="[
+                multiSelect && item.verify === false ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
+                multiSelect && isSelected(item) ? 'bg-[hsl(var(--accent)/.7)]' : '',
+              ]"
               :title="item.content || ''"
               @click="selectItem(item)"
             >
               <div class="flex items-center justify-between gap-2">
                 <div class="flex min-w-0 items-center gap-1.5">
+                  <component
+                    v-if="multiSelect"
+                    :is="isSelected(item) ? CheckSquare : Square"
+                    class="h-3.5 w-3.5 shrink-0"
+                    :class="isSelected(item) ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'"
+                  />
                   <CheckCircle2 v-if="item.verify === true" class="h-3.5 w-3.5 shrink-0 text-green-500" />
                   <XCircle v-else-if="item.verify === false" class="h-3.5 w-3.5 shrink-0 text-red-400" />
                   <Loader2 v-else class="h-3.5 w-3.5 shrink-0 animate-spin text-[hsl(var(--muted-foreground))]" />
@@ -504,6 +584,13 @@ watch(
                   <Badge v-if="item.isLargest" variant="outline" class="border-amber-200 bg-amber-50 text-[10px] text-amber-600">最大</Badge>
                   <span v-if="item.maxFileSize" class="text-[10px] text-[hsl(var(--muted-foreground))]">{{ formatSize(item.maxFileSize) }}</span>
                   <Badge v-if="item.source" variant="outline" class="text-[10px]">{{ item.source }}</Badge>
+                  <button
+                    class="icon-action h-6 w-auto gap-0.5 px-1.5 text-[10px]"
+                    title="预览分享内容"
+                    @click.stop="openItemPreview(item)"
+                  >
+                    <Eye class="h-3 w-3" /> 预览
+                  </button>
                 </div>
               </div>
               <a
@@ -530,10 +617,33 @@ watch(
 
         <!-- Footer -->
         <div class="modal-bar flex items-center justify-between border-t border-[hsl(var(--border))] px-4 py-2.5 text-xs text-[hsl(var(--muted-foreground))] sm:px-5">
-          <span>共 {{ stats.total }} 条结果，点击条目填入分享链接</span>
-          <Button size="sm" variant="ghost" @click="close">关闭</Button>
+          <span v-if="multiSelect">共 {{ stats.total }} 条结果，已选 {{ selectedItems.length }} 项</span>
+          <span v-else>共 {{ stats.total }} 条结果，点击条目填入分享链接</span>
+          <div class="flex items-center gap-2">
+            <template v-if="multiSelect">
+              <Button
+                v-for="act in (actions || [])"
+                :key="act.key"
+                size="sm"
+                :disabled="actionDisabled(act)"
+                @click="runAction(act)"
+              >
+                {{ act.label }}
+              </Button>
+            </template>
+            <Button size="sm" variant="ghost" @click="close">关闭</Button>
+          </div>
         </div>
       </div>
     </div>
   </Teleport>
+
+  <!-- 逐条只读预览：仅看内容与重命名结果，不可选目录 -->
+  <SharePreviewDialog
+    v-model:visible="previewVisible"
+    :shareurl="previewUrl"
+    :readonly="true"
+    :preview-context="previewContext"
+    :z-index="110"
+  />
 </template>

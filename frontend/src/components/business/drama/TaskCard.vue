@@ -56,6 +56,20 @@ const statusTone = computed(() => {
 
 const isEnded = computed(() => props.task.tmdb_is_ended === true || props.task.extra?.ended === true)
 
+/** 除当前主链接外的其它分享链接数量（每次运行均会逐条转存） */
+const backupLinkCount = computed(() => {
+  const links = props.task.shareurls || []
+  return Math.max(0, links.filter((x) => !x.is_active).length)
+})
+
+const banLabel = computed(() => {
+  const ban = String(props.task.shareurl_ban || '')
+  if (!ban) return ''
+  return backupLinkCount.value ? `${ban}（共 ${backupLinkCount.value + 1} 条链接，已全部尝试）` : ban
+})
+
+const banTitle = computed(() => banLabel.value)
+
 /** 剧集播出状态：完结 / 连载（仅 TMDB 剧集类型可判定） */
 const airStatusLabel = computed(() => {
   const task = props.task
@@ -209,14 +223,15 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
       <div class="drama-card__meta-row" :title="task.shareurl">
         <Link2 class="h-3.5 w-3.5 shrink-0" />
         <span class="truncate">{{ truncate(task.shareurl, 36) }}</span>
+        <span v-if="backupLinkCount" class="pill pill--accent shrink-0" :title="`共 ${backupLinkCount + 1} 条链接，每次运行均会逐条转存`">+{{ backupLinkCount }} 源</span>
       </div>
       <div class="drama-card__meta-row" :title="task.savepath">
         <FolderClosed class="h-3.5 w-3.5 shrink-0" />
         <span class="truncate">{{ task.savepath || '-' }}</span>
       </div>
-      <div v-if="task.shareurl_ban" class="drama-card__meta-row drama-card__meta-row--ban" :title="task.shareurl_ban">
+      <div v-if="task.shareurl_ban" class="drama-card__meta-row drama-card__meta-row--ban" :title="banTitle">
         <ShieldAlert class="h-3.5 w-3.5 shrink-0" />
-        <span class="truncate">{{ task.shareurl_ban }}</span>
+        <span class="truncate">{{ banLabel }}</span>
       </div>
     </div>
 

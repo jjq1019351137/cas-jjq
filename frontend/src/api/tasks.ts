@@ -9,6 +9,7 @@ import type {
   TaskExecutionItem,
   TaskItem,
   TaskSchedulerSetting,
+  TaskShareUrlsCheckResponse,
 } from '@/types/tasks'
 import { detectDriveTypeByUrl } from '@/utils/driveType'
 
@@ -27,6 +28,7 @@ export async function createTask(payload: {
   task_type: string
   taskname: string
   shareurl: string
+  shareurls?: string[]
   savepath: string
   sync_task_uids?: string[]
   pattern?: string | null
@@ -53,6 +55,7 @@ export async function updateTask(
     task_type: string
     taskname: string
     shareurl: string
+    shareurls: string[]
     savepath: string
     sync_task_uids: string[]
     pattern: string | null
@@ -208,6 +211,21 @@ export async function mkdirDrive(payload: { dir_path: string; account_name?: str
 
 export async function repairBannedDramaTasks() {
   const { data } = await http.post<RepairBannedTasksResponse>('/tasks/repair-banned', null, { headers: { 'X-Silent-Toast': '1' } })
+  return data
+}
+
+export async function checkTaskShareUrls(taskId: number, shareurls?: string[]) {
+  const urls = (shareurls || []).map((x) => String(x || '').trim()).filter(Boolean)
+  const { data } = await http.post<TaskShareUrlsCheckResponse>(
+    `/tasks/${taskId}/shareurls/check`,
+    { shareurls: urls.length ? urls : null },
+    { timeout: 120000, headers: { 'X-Silent-Toast': '1' } },
+  )
+  return data
+}
+
+export async function activateTaskShareUrl(taskId: number, shareurl: string) {
+  const { data } = await http.post<TaskItem>(`/tasks/${taskId}/shareurls/activate`, { shareurl }, { headers: { 'X-Silent-Toast': '1' } })
   return data
 }
 

@@ -16,6 +16,7 @@ from app.models.drive_account import DriveAccount
 from app.schemas.task_browse import SharePreviewBatchIn, SharePreviewBatchItemOut
 from app.services.resource_search import fetch_task_suggestions
 from app.services.share_preview_batch import preview_share_batch
+from app.services.task_share_links import replace_active_link
 from app.services.title_match import extract_progress, title_matches_names
 from app.services.title_vector_match import is_vector_fallback_enabled, vector_recall
 from app.services.tmdb_cache import get_tmdb_detail_cached
@@ -518,9 +519,8 @@ def resolve_drama_shareurl_update(db: Session, task: Any, *, respect_toggle: boo
             "db_changed": bool(current_preview_changed or suggestions_changed or preview_changed),
         }
 
-    task.shareurl = new_shareurl
-    task.shareurl_ban = None
-    db.flush()
+    # 新链接插入多链接列表首位成为活跃链接（旧链接保留在列表尾部，同时清空 shareurl_ban）
+    replace_active_link(db, task, new_shareurl, source="repair")
     logger.info(
         "[shareurl_autoupdate] task_id=%s old=%s new=%s current=S%sE%s next=S%sE%s",
         int(getattr(task, "id", 0) or 0),

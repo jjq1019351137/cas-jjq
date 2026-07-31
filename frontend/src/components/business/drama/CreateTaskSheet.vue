@@ -4,20 +4,21 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
   X, Eye, Loader2, ChevronDown, ChevronUp, Folder, FolderOpen, Search,
-  Play, ArrowUp, ArrowDown, FileText, ChevronLeft, ChevronRight, RefreshCw, GripVertical, BookOpen, Check,
+  Play, ArrowUp, ArrowDown, FileText, ChevronRight, GripVertical, BookOpen, Check,
 } from 'lucide-vue-next'
 import { previewShare, previewShareBatch, browseDrive, fetchTasks } from '@/api/tasks'
 import type { TaskSuggestionItem } from '@/types/resourceSearch'
-import ResourceSearchDialog from '@/components/business/drama/ResourceSearchDialog.vue'
+import ResourceSearchDialog, { type ResourceSearchAction } from '@/components/business/drama/ResourceSearchDialog.vue'
+import SharePreviewDialog from '@/components/business/drama/SharePreviewDialog.vue'
 import { searchTMDB, fetchTMDBDetail } from '@/api/media'
 import { useToast } from '@/composables/useToast'
-import { useCreateTaskMutation, useUpdateTaskMutation } from '@/hooks/mutations/tasks'
+import { useCreateTaskMutation, useUpdateTaskMutation, useCheckTaskShareUrlsMutation, useActivateTaskShareUrlMutation } from '@/hooks/mutations/tasks'
 import { useDriveAccountsQuery, usePluginsQuery } from '@/hooks/queries/extensions'
 import { useSyncTasksQuery } from '@/hooks/queries/sync'
 import { useTasksQuery, useMagicRegexQuery } from '@/hooks/queries/tasks'
 import { detectDriveTypeByUrl } from '@/utils/driveType'
 import type { DramaTaskPreset } from '@/types/dramaLauncher'
-import type { TaskItem, SharePreviewItem, DriveBrowseItem } from '@/types/tasks'
+import type { TaskItem, SharePreviewItem, DriveBrowseItem, TaskShareUrlItem } from '@/types/tasks'
 import type { TMDBBrief } from '@/types/media'
 
 const props = defineProps<{
@@ -34,6 +35,8 @@ const emit = defineEmits<{
 const { toast } = useToast()
 const createMutation = useCreateTaskMutation()
 const updateMutation = useUpdateTaskMutation()
+const checkShareUrlsMutation = useCheckTaskShareUrlsMutation()
+const activateShareUrlMutation = useActivateTaskShareUrlMutation()
 const { data: accountsData } = useDriveAccountsQuery()
 const { data: syncTasksData } = useSyncTasksQuery()
 const { data: pluginsData } = usePluginsQuery()
@@ -82,15 +85,6 @@ const previewError = ref('')
 const previewItems = ref<SharePreviewItem[]>([])
 const previewTotal = ref(0)
 const showPreviewModal = ref(false)
-const previewPage = ref(1)
-const previewPageSize = 20
-const previewDirStack = ref<{ pdir_fid: string; name: string }[]>([])
-const previewForcedRoot = ref(false)
-const previewTotalPages = computed(() => Math.max(1, Math.ceil(previewItems.value.length / previewPageSize)))
-const previewPageItems = computed(() => {
-  const start = (previewPage.value - 1) * previewPageSize
-  return previewItems.value.slice(start, start + previewPageSize)
-})
 
 // Path browser state
 const showPathBrowser = ref(false)
@@ -130,6 +124,56 @@ const isInitializing = ref(false)
 const showResourceSearch = ref(false)
 const resourceSearchOpening = ref(false)
 const resourceSearchQuery = ref('')
+
+// ===== 备用分享链接 =====
+/** 备用链接行（不含主链接）；主链接始终为 state.shareurl */
+type BackupLinkRow = {
+  url: string
+  status: 'unknown' | 'ok' | 'invalid' | string
+  reason?: string | null
+  last_checked_at?: string | null
+  /** 正在自动定位实际文件夹 */
+  locating?: boolean
+}
+const backupLinks = ref<BackupLinkRow[]>([])
+/** 链接列表上限（与后端 MAX_SHARE_LINKS 一致）：主链接 + 备用链接合计 */
+const MAX_SHARE_LINKS = 10
+const MAX_BACKUP_LINKS = MAX_SHARE_LINKS - 1
+const backupOpen = ref(false)
+const backupInput = ref('')
+const backupChecking = ref(false)
+const backupEditSnapshot = ref('')
+/** 正在调用 activate 接口切换主链接的行序号 */
+const promotingIndex = ref<number | null>(null)
+const mainLinkStatus = ref<BackupLinkRow['status']>('unknown')
+const mainLinkReason = ref<string | null>(null)
+
+// 备用链接预览（与主链接预览一致，可选目录）
+const backupPreviewVisible = ref(false)
+const backupPreviewUrl = ref('')
+/** 当前预览的备用链接行引用，供“使用当前文件夹”写回对应行 */
+const backupPreviewRow = ref<BackupLinkRow | null>(null)
+
+// 资源搜索打开来源：main=主链接旁搜索；backup=备用区搜索添加；replace:{index}=换链
+const resourceSearchOrigin = ref<'main' | 'backup' | `replace:${number}`>('main')
+
+const RESOURCE_ACTIONS_MAIN: ResourceSearchAction[] = [
+  { key: 'replace_main', label: '替换主链接', min: 1, max: 1 },
+  { key: 'append_backup', label: '追加为备用链接', min: 1 },
+]
+const RESOURCE_ACTIONS_BACKUP: ResourceSearchAction[] = [
+  { key: 'append_backup', label: '追加为备用链接', min: 1 },
+]
+const RESOURCE_ACTIONS_REPLACE: ResourceSearchAction[] = [
+  { key: 'replace_one', label: '替换此链接', min: 1, max: 1 },
+]
+
+const resourceSearchActions = computed(() => {
+  const origin = resourceSearchOrigin.value
+  if (origin === 'main') return RESOURCE_ACTIONS_MAIN
+  if (origin === 'backup') return RESOURCE_ACTIONS_BACKUP
+  return RESOURCE_ACTIONS_REPLACE
+})
 
 // Plugin expand state
 const expandedPlugins = ref(new Set<string>())
@@ -214,10 +258,21 @@ function formatTime(ts: any): string {
 }
 
 // Sync state from editTask
+/**
+ * 已初始化的表单标识：避免弹窗打开期间任务列表 refetch（如“验证全部”/“设为主链接”触发
+ * invalidateQueries 后新的 editTask 对象）重新初始化表单，把尚未保存的备用链接与链接状态覆盖掉。
+ */
+const initializedFormKey = ref('')
 watch(
   () => [props.open, props.editTask, props.presetTmdb] as const,
   ([open, task, preset]) => {
-    if (!open) return
+    if (!open) {
+      initializedFormKey.value = ''
+      return
+    }
+    const formKey = task?.id ? `task:${task.id}` : `new:${preset?.tmdb_id ?? ''}:${preset?.taskname ?? ''}`
+    if (initializedFormKey.value === formKey) return
+    initializedFormKey.value = formKey
     const shouldOpenTmdbSearch = !task && Boolean(preset?.open_tmdb_search)
     const nextTmdbQuery = shouldOpenTmdbSearch ? String(preset?.tmdb_search_query || preset?.taskname || '').trim() : ''
     if (task) {
@@ -268,6 +323,7 @@ watch(
       }
       // Load addition from task
       initAdditionFromTask(task.addition)
+      initShareLinksFromTask(task.shareurls, task.shareurl || '')
       nextTick(() => { isInitializing.value = false })
     } else {
       resetForm()
@@ -295,7 +351,6 @@ watch(
     tmdbSearchConfigured.value = true
     showStartfidPicker.value = false
     showPreviewModal.value = false
-    previewPage.value = 1
     savepathTouched.value = Boolean(task)
     savepathLastApplied.value = ''
     autoLocateRunId.value += 1
@@ -332,6 +387,351 @@ function resetForm() {
   state.update_subdir_resave_mode = 'none'
   state.addition = {}
   advancedOpen.value = false
+  backupLinks.value = []
+  backupOpen.value = false
+  backupInput.value = ''
+  mainLinkStatus.value = 'unknown'
+  mainLinkReason.value = null
+}
+
+// ===== 备用链接管理 =====
+/** 从任务回显多链接：首位（is_active）为主链接，其余为备用 */
+function initShareLinksFromTask(links: TaskShareUrlItem[] | undefined | null, activeUrl: string) {
+  const list = Array.isArray(links) ? links : []
+  const active = String(activeUrl || '').trim()
+  const mainRow = list.find((x) => x.url === active)
+  mainLinkStatus.value = mainRow?.status || 'unknown'
+  mainLinkReason.value = mainRow?.reason || null
+  backupLinks.value = list
+    .filter((x) => x.url && x.url !== active)
+    .map((x) => ({ url: x.url, status: x.status || 'unknown', reason: x.reason || null, last_checked_at: x.last_checked_at || null }))
+  backupOpen.value = backupLinks.value.length > 0
+}
+
+/** 当前已占用的链接集合（主链接 + 备用） */
+function usedLinkSet(): Set<string> {
+  const set = new Set<string>()
+  const main = String(state.shareurl || '').trim()
+  if (main) set.add(main)
+  for (const row of backupLinks.value) set.add(row.url)
+  return set
+}
+
+/** 同盘校验：备用链接必须与主链接同网盘类型 */
+function isSameDriveAsMain(url: string): boolean {
+  const main = String(state.shareurl || '').trim()
+  if (!main) return true
+  const mainDt = detectDriveTypeByUrl(main)
+  const dt = detectDriveTypeByUrl(url)
+  if (!mainDt || !dt) return false
+  return String(mainDt) === String(dt)
+}
+
+function appendBackupLinks(urls: string[]): number {
+  const used = usedLinkSet()
+  let added = 0
+  let skippedDup = 0
+  let skippedDrive = 0
+  let skippedLimit = 0
+  const addedRows: BackupLinkRow[] = []
+  for (const raw of urls) {
+    const url = String(raw || '').trim()
+    if (!url) continue
+    if (used.has(url)) {
+      skippedDup += 1
+      continue
+    }
+    if (!isSameDriveAsMain(url)) {
+      skippedDrive += 1
+      continue
+    }
+    if (backupLinks.value.length >= MAX_BACKUP_LINKS) {
+      skippedLimit += 1
+      continue
+    }
+    used.add(url)
+    backupLinks.value.push({ url, status: 'unknown', reason: null, last_checked_at: null })
+    // 持行对象引用（而非行号）：异步定位期间用户可能移动/删除其它行
+    addedRows.push(backupLinks.value[backupLinks.value.length - 1])
+    added += 1
+  }
+  if (skippedDup) toast.error(`已跳过 ${skippedDup} 个重复链接`)
+  if (skippedDrive) toast.error(`已跳过 ${skippedDrive} 个不同网盘类型的链接`)
+  if (skippedLimit) toast.error(`备用链接最多 ${MAX_BACKUP_LINKS} 个，已跳过 ${skippedLimit} 个`)
+  if (added) {
+    backupOpen.value = true
+    toast.success(`已添加 ${added} 个备用链接`)
+    // 与主链接一致：新增后自动定位到实际文件夹
+    for (const row of addedRows) locateBackupLink(row).catch(() => {})
+  }
+  return added
+}
+
+/** 自动定位到实际文件夹：先按 resolved_pdir_fid 重写链接，再对单目录下钻一层 */
+async function resolveShareurlFolder(rawUrl: string): Promise<string> {
+  const url = String(rawUrl || '').trim()
+  if (!url) return url
+  const accountName = state.account_choice !== '__AUTO__' ? state.account_choice : null
+  let resolved = url
+  try {
+    const batchRes = await previewShareBatch({ shareurls: [url], account_name: accountName })
+    const row = (batchRes.items || []).find((x) => String(x.shareurl || '').trim() === url)
+    if (row && row.ok) {
+      const fid = String((row as any).pdir_fid || (row as any).resolved_pdir_fid || '').trim()
+      // 排除根目录与路径型 fid（如百度的 '/'）：无需/无法重写链接
+      if (fid && fid !== '0' && fid !== 'root' && !fid.includes('/')) {
+        const next = getShareurl(url, { fid })
+        if (next) resolved = next
+      }
+    }
+  } catch {
+    return resolved
+  }
+  try {
+    const res = await previewShare(buildPreviewParams({ shareurl: resolved }))
+    const items = res.items || []
+    if (items.length === 1 && items[0].is_dir) {
+      const deep = getShareurl(resolved, { fid: items[0].fid })
+      if (deep && deep !== resolved) resolved = deep
+    }
+  } catch { /* 定位失败保持原链接 */ }
+  return resolved
+}
+
+/**
+ * 对指定备用链接执行自动定位；定位后链接变化则重置校验状态。
+ * 按行对象引用操作（不用行号）：异步期间用户上下移/删除其它行时，行号会漂移，
+ * 导致 locating 标志被写到错误行上，使那一行永远停在“定位中”且按钮被禁用。
+ */
+async function locateBackupLink(row: BackupLinkRow) {
+  if (!row || !row.url.trim()) return
+  const origin = row.url
+  row.locating = true
+  try {
+    const resolved = await resolveShareurlFolder(origin)
+    // 定位期间该行可能已被删除或链接被改，仅在仍存在且未变时写回
+    if (!backupLinks.value.includes(row) || row.url !== origin) return
+    if (resolved && resolved !== origin) {
+      const used = usedLinkSet()
+      used.delete(origin)
+      if (used.has(resolved)) {
+        toast.error('自动定位后的链接与已有链接重复，已保留原链接')
+        return
+      }
+      row.url = resolved
+      row.status = 'unknown'
+      row.reason = null
+      row.last_checked_at = null
+    }
+  } finally {
+    row.locating = false
+  }
+}
+
+/** 备用链接手工编辑完成：同盘/去重校验后重置状态并自动定位 */
+function onBackupUrlEdited(index: number, previous: string) {
+  const row = backupLinks.value[index]
+  if (!row) return
+  const url = String(row.url || '').trim()
+  row.url = url
+  if (!url) {
+    row.url = previous
+    return
+  }
+  if (url === previous) return
+  const duplicated = [String(state.shareurl || '').trim(), ...backupLinks.value.filter((_x, i) => i !== index).map((x) => x.url)]
+    .filter(Boolean)
+    .includes(url)
+  if (duplicated) {
+    toast.error('该链接已存在')
+    row.url = previous
+    return
+  }
+  if (!isSameDriveAsMain(url)) {
+    toast.error('备用链接必须与主链接同网盘类型')
+    row.url = previous
+    return
+  }
+  row.status = 'unknown'
+  row.reason = null
+  row.last_checked_at = null
+}
+
+function addBackupFromInput() {
+  const url = backupInput.value.trim()
+  if (!url) return
+  if (!state.shareurl.trim()) {
+    toast.error('请先填写主分享链接')
+    return
+  }
+  if (backupLinks.value.length >= MAX_BACKUP_LINKS) {
+    toast.error(`备用链接最多 ${MAX_BACKUP_LINKS} 个`)
+    return
+  }
+  if (appendBackupLinks([url])) backupInput.value = ''
+}
+
+function removeBackupLink(index: number) {
+  backupLinks.value.splice(index, 1)
+}
+
+function moveBackupLink(index: number, direction: -1 | 1) {
+  const target = index + direction
+  if (target < 0 || target >= backupLinks.value.length) return
+  const arr = [...backupLinks.value]
+  const [row] = arr.splice(index, 1)
+  arr.splice(target, 0, row)
+  backupLinks.value = arr
+}
+
+/** 将备用链接提升为主链接（仅调整表单状态） */
+function applyPromoteLocally(index: number) {
+  const row = backupLinks.value[index]
+  if (!row) return
+  const oldMain = String(state.shareurl || '').trim()
+  const oldStatus = mainLinkStatus.value
+  const oldReason = mainLinkReason.value
+  skipNextShareurlAutoLocate.value = true
+  state.shareurl = row.url
+  // startfid 是旧主链接内的文件 fid，换主链接后已失效
+  state.startfid = ''
+  mainLinkStatus.value = row.status
+  mainLinkReason.value = row.reason || null
+  const arr = [...backupLinks.value]
+  arr.splice(index, 1)
+  if (oldMain) arr.unshift({ url: oldMain, status: oldStatus, reason: oldReason, last_checked_at: null })
+  backupLinks.value = arr.slice(0, MAX_BACKUP_LINKS)
+}
+
+/**
+ * 设为主链接：链接已存在于已保存任务时调 activate 接口立即生效（同时清空封禁、写审计）；
+ * 尚未保存的链接只能先在表单内调整，保存后生效。
+ */
+async function promoteBackupLink(index: number) {
+  const row = backupLinks.value[index]
+  if (!row) return
+  const taskId = Number(props.editTask?.id) || 0
+  const persisted = (props.editTask?.shareurls || []).some((x) => x.url === row.url)
+  if (taskId > 0 && persisted) {
+    promotingIndex.value = index
+    try {
+      await activateShareUrlMutation.mutateAsync({ taskId, shareurl: row.url })
+      applyPromoteLocally(index)
+      mainLinkStatus.value = 'ok'
+      mainLinkReason.value = null
+      toast.success('已切换为主链接（已生效）')
+    } catch (e: any) {
+      toast.error(e?.message || '切换主链接失败')
+    } finally {
+      promotingIndex.value = null
+    }
+    return
+  }
+  applyPromoteLocally(index)
+  toast.success('已设为主链接，保存后生效')
+}
+
+function openBackupPreview(row: BackupLinkRow) {
+  if (!row || !row.url.trim()) return
+  backupPreviewRow.value = row
+  backupPreviewUrl.value = row.url
+  backupPreviewVisible.value = true
+}
+
+/** 备用链接预览弹窗“使用当前文件夹”：将选中目录写回该条备用链接 */
+function onPickBackupFolder(payload: { root: boolean; pdir_fid?: string; name?: string }) {
+  const row = backupPreviewRow.value
+  if (!row || !backupLinks.value.includes(row)) {
+    backupPreviewVisible.value = false
+    return
+  }
+  const baseUrl = row.url.trim()
+  const nextUrl = payload.root
+    ? stripShareurlSubdir(baseUrl)
+    : (String(payload.pdir_fid || '').trim() ? getShareurl(baseUrl, { fid: String(payload.pdir_fid), name: payload.name }) : baseUrl)
+  if (!nextUrl) return
+  if (nextUrl !== baseUrl) {
+    const duplicated = [String(state.shareurl || '').trim(), ...backupLinks.value.filter((x) => x !== row).map((x) => x.url)]
+      .filter(Boolean)
+      .includes(nextUrl)
+    if (duplicated) {
+      toast.error('该目录对应的链接已存在')
+      backupPreviewVisible.value = false
+      return
+    }
+    row.url = nextUrl
+    row.status = 'unknown'
+    row.reason = null
+    row.last_checked_at = null
+  }
+  toast.success(payload.root ? '已使用分享根目录' : `已选择当前目录: ${payload.name || ''}`)
+  backupPreviewVisible.value = false
+}
+
+/** 预览上下文：供只读预览复算重命名结果 */
+const sharePreviewContext = computed(() => ({
+  taskname: state.taskname || undefined,
+  pattern: state.pattern || null,
+  replace: state.replace || null,
+  sort_index: state.sort_index ?? null,
+  savepath: state.savepath || null,
+  ignore_extension: state.ignore_extension ?? null,
+  update_subdir: state.update_subdir || null,
+  startfid: state.startfid || null,
+  tmdb_id: state.tmdb_id ?? null,
+  tmdb_media_type: state.tmdb_media_type || null,
+  account_name: state.account_choice !== '__AUTO__' ? state.account_choice : null,
+}))
+
+function statusLabel(status: string): string {
+  if (status === 'ok') return '可用'
+  if (status === 'invalid') return '失效'
+  return '未验证'
+}
+
+function statusClass(status: string): string {
+  if (status === 'ok') return 'border-green-200 bg-green-50 text-green-600'
+  if (status === 'invalid') return 'border-red-200 bg-red-50 text-red-500'
+  return 'text-[hsl(var(--muted-foreground))]'
+}
+
+/** 验证全部链接：编辑态走后端接口落库，新建态仅前端展示 */
+async function checkAllShareLinks() {
+  const main = String(state.shareurl || '').trim()
+  if (!main) {
+    toast.error('请先填写主分享链接')
+    return
+  }
+  backupChecking.value = true
+  try {
+    const urls = [main, ...backupLinks.value.map((x) => x.url).filter(Boolean)]
+    const applyResults = (rows: { url: string; ok: boolean; message?: string | null }[]) => {
+      const map = new Map(rows.map((x) => [String(x.url || '').trim(), x]))
+      const mainRow = map.get(main)
+      if (mainRow) {
+        mainLinkStatus.value = mainRow.ok ? 'ok' : 'invalid'
+        mainLinkReason.value = mainRow.ok ? null : (mainRow.message || null)
+      }
+      backupLinks.value = backupLinks.value.map((row) => {
+        const hit = map.get(row.url)
+        if (!hit) return row
+        return { ...row, status: hit.ok ? 'ok' : 'invalid', reason: hit.ok ? null : (hit.message || null) }
+      })
+    }
+    if (isEditing.value && props.editTask?.id) {
+      // 传入表单当前列表：尚未保存的备用链接也能拿到验证结果（已保存的同时落库）
+      const res = await checkShareUrlsMutation.mutateAsync({ taskId: props.editTask.id, shareurls: urls })
+      applyResults((res.items || []).map((x) => ({ url: x.url, ok: x.ok, message: x.message })))
+    } else {
+      const res = await previewShareBatch({ shareurls: urls, account_name: state.account_choice !== '__AUTO__' ? state.account_choice : null })
+      applyResults((res.items || []).map((x) => ({ url: String(x.shareurl || '').trim(), ok: Boolean(x.ok), message: x.message })))
+    }
+    toast.success('链接验证完成')
+  } catch (e: any) {
+    toast.error(e?.message || '链接验证失败')
+  } finally {
+    backupChecking.value = false
+  }
 }
 
 function extractRunweekFromTmdbDetail(detail: any) {
@@ -718,91 +1118,42 @@ function buildPreviewParams(overrides: Record<string, any> = {}) {
 async function handlePreview() {
   const url = state.shareurl.trim()
   if (!url) return
-  previewing.value = true
   previewError.value = ''
   previewItems.value = []
   previewTotal.value = 0
-  previewDirStack.value = []
-  previewForcedRoot.value = false
+  // 内容加载与目录导航统一由 SharePreviewDialog 负责
+  showPreviewModal.value = true
+}
+
+/** 主链接预览首次加载完成：回填任务名与预览计数 */
+function onMainPreviewLoaded(items: SharePreviewItem[]) {
+  previewItems.value = items
+  previewTotal.value = items.length
+  if (!state.taskname && items.length > 0) {
+    state.taskname = items[0].name || ''
+  }
+  previewHint.value = items.length ? `已预览 ${items.length} 个文件` : '链接无效或无文件'
+}
+
+/** 剥除分享链接上的子目录定位（#/list/share/xxx、fid= 参数），得到分享根链接 */
+function stripShareurlSubdir(shareurl: string): string {
+  const baseUrl = String(shareurl || '').trim()
+  if (!baseUrl) return baseUrl
   try {
-    const res = await previewShare(buildPreviewParams())
-    const items = res.items || []
-    previewTotal.value = items.length
-    previewItems.value = items
-    if (!state.taskname && items.length > 0) {
-      state.taskname = items[0].name || ''
-    }
-    if (items.length > 0) {
-      previewPage.value = 1
-      showPreviewModal.value = true
-    }
-  } catch (e: any) {
-    previewError.value = e?.message || '预览失败'
-  } finally {
-    previewing.value = false
+    const url = new URL(baseUrl.startsWith('http') ? baseUrl : `https://x.com/${baseUrl}`)
+    url.searchParams.delete('fid')
+    url.hash = ''
+    return baseUrl.startsWith('http') ? url.toString() : `${url.pathname.slice(1)}${url.search}`
+  } catch {
+    return baseUrl.replace(/#\/list\/share\/[^?]*/g, '').replace(/([?&])fid=[^&]*&?/g, '$1').replace(/[?&]$/, '')
   }
 }
 
-async function handlePreviewRefresh() {
-  const pdirFid = previewDirStack.value.length > 0 ? previewDirStack.value[previewDirStack.value.length - 1].pdir_fid : undefined
-  await loadPreviewDir(pdirFid)
-}
-
-async function loadPreviewDir(pdirFid?: string) {
-  const url = state.shareurl.trim()
-  if (!url) return
-  previewing.value = true
-  previewError.value = ''
-  try {
-    const pdirParam = pdirFid || (previewForcedRoot.value ? '' : null)
-    const res = await previewShare(buildPreviewParams({ pdir_fid: pdirParam }))
-    const items = res.items || []
-    previewTotal.value = items.length
-    previewItems.value = items
-    previewPage.value = 1
-  } catch (e: any) {
-    previewError.value = e?.message || '加载失败'
-  } finally {
-    previewing.value = false
-  }
-}
-
-async function enterPreviewDir(item: SharePreviewItem) {
-  previewDirStack.value.push({ pdir_fid: item.fid, name: item.name })
-  await loadPreviewDir(item.fid)
-}
-
-function previewGoBack() {
-  previewDirStack.value.pop()
-  const last = previewDirStack.value.length > 0 ? previewDirStack.value[previewDirStack.value.length - 1].pdir_fid : undefined
-  loadPreviewDir(last)
-}
-
-function previewGoRoot() {
-  previewDirStack.value = []
-  previewForcedRoot.value = true
-  loadPreviewDir(undefined)
-}
-
-/** Whether the current shareurl already points to a subdir (has fid param) */
-const shareurlHasFid = computed(() => {
-  const raw = String(state.shareurl || '').trim()
-  return /[?&#]fid=/i.test(raw) || /#\/list\/share\//i.test(raw)
-})
-
-function pickCurrentShareFolder() {
-  // 根目录：剥掉 shareurl 中的子目录定位（#/list/share/xxx、fid= 参数）
-  if (previewForcedRoot.value && previewDirStack.value.length === 0) {
+/** 预览弹窗“使用当前文件夹”：根目录则剥除子目录定位，否则将 fid 写回 shareurl */
+function onPickShareFolder(payload: { root: boolean; pdir_fid?: string; name?: string }) {
+  if (payload.root) {
     const baseUrl = state.shareurl.trim()
-    let nextShareurl = baseUrl
-    try {
-      const url = new URL(baseUrl.startsWith('http') ? baseUrl : `https://x.com/${baseUrl}`)
-      url.searchParams.delete('fid')
-      url.hash = ''
-      nextShareurl = baseUrl.startsWith('http') ? url.toString() : `${url.pathname.slice(1)}${url.search}`
-    } catch {
-      nextShareurl = baseUrl.replace(/#\/list\/share\/[^?]*/g, '').replace(/([?&])fid=[^&]*&?/g, '$1').replace(/[?&]$/, '')
-    }
+    const nextShareurl = stripShareurlSubdir(baseUrl)
     if (nextShareurl !== baseUrl) {
       skipNextShareurlAutoLocate.value = true
       state.shareurl = nextShareurl
@@ -813,21 +1164,18 @@ function pickCurrentShareFolder() {
     showPreviewModal.value = false
     return
   }
-  const current = previewDirStack.value.at(-1)
-  if (current) {
-    // Update startfid to null and record the pdir_fid in shareurl query
-    state.startfid = ''
-    // Build a new shareurl with pdir_fid appended
-    const baseUrl = state.shareurl.trim()
-    const nextShareurl = getShareurl(baseUrl, { fid: current.pdir_fid, name: current.name })
-    if (nextShareurl !== baseUrl) {
-      skipNextShareurlAutoLocate.value = true
-      state.shareurl = nextShareurl
-    }
-    previewHint.value = `已使用当前文件夹: ${current.name}`
-    toast.success(`已选择当前目录: ${current.name}`)
-    showPreviewModal.value = false
+  const fid = String(payload.pdir_fid || '').trim()
+  if (!fid) return
+  state.startfid = ''
+  const baseUrl = state.shareurl.trim()
+  const nextShareurl = getShareurl(baseUrl, { fid, name: payload.name })
+  if (nextShareurl !== baseUrl) {
+    skipNextShareurlAutoLocate.value = true
+    state.shareurl = nextShareurl
   }
+  previewHint.value = `已使用当前文件夹: ${payload.name || ''}`
+  toast.success(`已选择当前目录: ${payload.name || ''}`)
+  showPreviewModal.value = false
 }
 
 // ===== Path Browser =====
@@ -1043,6 +1391,7 @@ function buildPayload() {
     task_type: 'drama',
     taskname: state.taskname.trim() || '未命名任务',
     shareurl: state.shareurl.trim(),
+    shareurls: [state.shareurl.trim(), ...backupLinks.value.map((x) => x.url)].filter(Boolean),
     savepath: state.savepath.trim(),
     sync_task_uids: [...state.sync_task_uids],
     pattern: state.pattern.trim() || null,
@@ -1146,6 +1495,7 @@ const resourceSearchDriveTypes = computed(() => {
 
 function openResourceSearch() {
   if (resourceSearchOpening.value) return
+  resourceSearchOrigin.value = 'main'
   resourceSearchOpening.value = true
   ;(async () => {
     let q = String(state.taskname || '').trim()
@@ -1167,6 +1517,78 @@ function onResourceSelected(item: TaskSuggestionItem) {
   if (!state.taskname?.trim() && item.taskname) state.taskname = item.taskname
 }
 
+/** 多选搜索动作：替换主链接 / 追加备用 / 替换指定备用链接 */
+function onResourceAction(key: string, items: TaskSuggestionItem[]) {
+  const urls = items.map((x) => String(x.shareurl || '').trim()).filter(Boolean)
+  if (!urls.length) return
+  if (key === 'replace_main') {
+    const first = items[0]
+    const url = urls[0]
+    // 旧主链接降为备用（同盘时），避免直接丢弃已配置链接
+    const oldMain = String(state.shareurl || '').trim()
+    state.shareurl = url
+    // 换主链接后原链接内的起始文件已失效
+    state.startfid = ''
+    mainLinkStatus.value = 'unknown'
+    mainLinkReason.value = null
+    if (oldMain && oldMain !== url && detectDriveTypeByUrl(oldMain) === detectDriveTypeByUrl(url)) {
+      const kept = backupLinks.value.filter((x) => x.url !== oldMain && x.url !== url)
+      // 旧主链接降为备用时也遵守上限，超限则丢弃最后一条
+      backupLinks.value = [
+        { url: oldMain, status: 'unknown', reason: null, last_checked_at: null },
+        ...kept,
+      ].slice(0, MAX_BACKUP_LINKS)
+    } else {
+      backupLinks.value = backupLinks.value.filter((x) => x.url !== url && isSameDriveAsMain(x.url))
+    }
+    if (!state.taskname?.trim() && first?.taskname) state.taskname = first.taskname
+    toast.success('已替换主链接')
+    return
+  }
+  if (key === 'append_backup') {
+    if (!state.shareurl.trim()) {
+      // 无主链接时首条作为主链接，其余作备用
+      state.shareurl = urls[0]
+      mainLinkStatus.value = 'unknown'
+      mainLinkReason.value = null
+      appendBackupLinks(urls.slice(1))
+      return
+    }
+    appendBackupLinks(urls)
+    return
+  }
+  if (key === 'replace_one') {
+    const origin = resourceSearchOrigin.value
+    const index = origin.startsWith('replace:') ? Number(origin.split(':')[1]) : -1
+    const url = urls[0]
+    if (index < 0 || index >= backupLinks.value.length) return
+    if (!isSameDriveAsMain(url)) {
+      toast.error('备用链接必须与主链接同网盘类型')
+      return
+    }
+    const used = usedLinkSet()
+    used.delete(backupLinks.value[index].url)
+    if (used.has(url)) {
+      toast.error('该链接已存在')
+      return
+    }
+    backupLinks.value[index] = { url, status: 'unknown', reason: null, last_checked_at: null }
+    locateBackupLink(backupLinks.value[index]).catch(() => {})
+    toast.success('已替换备用链接')
+  }
+}
+
+/** 备用区“搜索添加”/行“换链”入口 */
+function openResourceSearchForBackup(origin: 'backup' | `replace:${number}`) {
+  if (!state.shareurl.trim()) {
+    toast.error('请先填写主分享链接')
+    return
+  }
+  resourceSearchOrigin.value = origin
+  resourceSearchQuery.value = String(state.taskname || '').trim()
+  showResourceSearch.value = true
+}
+
 // ===== Helpers =====
 function getTmdbTitle(item: TMDBBrief): string {
   return item.title || item.name || item.original_title || item.original_name || ''
@@ -1181,74 +1603,15 @@ function getTmdbPoster(item: TMDBBrief): string {
 </script>
 
 <template>
-  <!-- ===== Preview Modal ===== -->
-  <Teleport to="body">
-    <div v-if="showPreviewModal" class="fixed inset-0 z-[100] flex items-center justify-center">
-      <div class="absolute inset-0 bg-black/60" @click="showPreviewModal = false" />
-      <div class="modal-surface relative z-10 flex max-h-[80vh] w-[720px] flex-col overflow-hidden">
-        <div class="modal-bar flex items-center justify-between border-b border-[hsl(var(--border))] px-5 py-3">
-          <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">分享链接预览（共 {{ previewTotal }} 个文件）</h3>
-          <button class="icon-action" @click="showPreviewModal = false">
-            <X class="h-4 w-4 text-[hsl(var(--muted-foreground))]" />
-          </button>
-        </div>
-        <!-- Toolbar -->
-        <div class="modal-bar flex items-center gap-2 border-b border-[hsl(var(--border))] px-5 py-2">
-          <button class="icon-action" title="刷新" @click="handlePreviewRefresh" :disabled="previewing">
-            <RefreshCw class="h-4 w-4" :class="previewing ? 'animate-spin' : ''" />
-          </button>
-          <button v-if="previewDirStack.length > 0 || shareurlHasFid" class="icon-action w-auto gap-1 px-2 text-xs" @click="previewGoRoot" title="回到分享根目录">
-            <Folder class="h-3.5 w-3.5" /> 根目录
-          </button>
-          <button v-if="previewDirStack.length > 0" class="icon-action w-auto gap-1 px-2 text-xs" @click="previewGoBack">
-            <ArrowUp class="h-3.5 w-3.5" /> 返回上级
-          </button>
-          <span v-if="previewDirStack.length > 0" class="text-xs text-[hsl(var(--muted-foreground))] truncate">/ {{ previewDirStack.map(d => d.name).join(' / ') }}</span>
-          <span v-else-if="previewForcedRoot" class="text-xs text-[hsl(var(--muted-foreground))]">分享根目录</span>
-          <span v-else-if="shareurlHasFid" class="text-xs text-[hsl(var(--muted-foreground))]">当前位于指定子目录</span>
-          <div class="flex-1" />
-          <Button size="sm" variant="default" @click="pickCurrentShareFolder" :disabled="!previewDirStack.length && !previewForcedRoot">
-            使用当前文件夹
-          </Button>
-        </div>
-        <!-- Table Header -->
-        <div class="grid grid-cols-[1fr_80px_1fr_120px] gap-2 px-3 py-2 border-b-2 border-[hsl(var(--border))] text-xs font-medium text-[hsl(var(--muted-foreground))]">
-          <span>名称</span><span>大小</span><span>重命名预览</span><span>时间</span>
-        </div>
-        <!-- Table Body -->
-        <div class="flex-1 overflow-y-auto">
-          <div
-            v-for="(item, idx) in previewPageItems"
-            :key="idx"
-            class="grid grid-cols-[1fr_80px_1fr_120px] gap-2 items-center px-3 py-2 border-b border-[hsl(var(--border))] hover:bg-[hsl(var(--accent)/.5)] text-sm"
-          >
-            <div class="flex items-center gap-2 min-w-0">
-              <component :is="item.is_dir ? Folder : FileText" class="h-4 w-4 shrink-0 text-[hsl(var(--muted-foreground))]" />
-              <span class="truncate" :class="item.is_dir ? 'cursor-pointer text-[hsl(var(--primary))] hover:underline' : ''" @click="item.is_dir && enterPreviewDir(item)">{{ item.name }}</span>
-            </div>
-            <div class="text-[hsl(var(--muted-foreground))] text-xs">{{ item.is_dir ? (item.include_items || item.children_count || 0) + '项' : formatSize(item.size || 0) }}</div>
-            <div class="truncate text-xs">
-              <span v-if="item.file_name_re" class="text-green-600">{{ item.file_name_re }}</span>
-              <span v-else-if="item.file_name_saved" class="text-[hsl(var(--muted-foreground))]">{{ item.file_name_saved }}</span>
-              <span v-else-if="state.pattern" class="text-red-500">×</span>
-              <span v-else class="text-[hsl(var(--muted-foreground))]">-</span>
-            </div>
-            <div class="text-[hsl(var(--muted-foreground))] text-xs">{{ formatTime(item.updated_at) }}</div>
-          </div>
-        </div>
-        <!-- Pagination -->
-        <div v-if="previewTotalPages > 1" class="modal-bar flex items-center justify-center gap-3 border-t border-[hsl(var(--border))] px-5 py-3">
-          <button class="icon-action" :disabled="previewPage <= 1" @click="previewPage--">
-            <ChevronLeft class="h-4 w-4 text-[hsl(var(--foreground))]" />
-          </button>
-          <span class="text-xs text-[hsl(var(--muted-foreground))]">{{ previewPage }} / {{ previewTotalPages }}</span>
-          <button class="icon-action" :disabled="previewPage >= previewTotalPages" @click="previewPage++">
-            <ChevronRight class="h-4 w-4 text-[hsl(var(--foreground))]" />
-          </button>
-        </div>
-      </div>
-    </div>
-  </Teleport>
+  <!-- ===== 主链接预览（可选目录）：复用通用预览组件 ===== -->
+  <SharePreviewDialog
+    v-model:visible="showPreviewModal"
+    :shareurl="state.shareurl"
+    :readonly="false"
+    :preview-context="sharePreviewContext"
+    @loaded="onMainPreviewLoaded"
+    @pick-folder="onPickShareFolder"
+  />
 
   <!-- ===== StartFID Picker Modal ===== -->
   <Teleport to="body">
@@ -1381,35 +1744,7 @@ function getTmdbPoster(item: TMDBBrief): string {
               <h3 class="section-heading">
                 基础信息
               </h3>
-
-              <!-- 分享链接 -->
-              <div>
-                <label class="mb-1.5 block text-sm font-medium text-[hsl(var(--foreground))]">
-                  分享链接 <span class="text-red-500">*</span>
-                </label>
-                <div class="flex gap-2">
-                  <Input v-model="state.shareurl" placeholder="粘贴分享链接..." class="flex-1" />
-                  <Button variant="outline" size="sm" :disabled="!state.shareurl.trim() || previewing" @click="handlePreview">
-                    <Loader2 v-if="previewing" class="h-4 w-4 animate-spin" />
-                    <Eye v-else class="h-4 w-4" />
-                  </Button>
-                </div>
-              </div>
-
-              <!-- 预览错误 -->
-              <div v-if="previewError" class="rounded-md bg-red-50 p-3 text-sm text-red-600 dark:bg-red-950/30 dark:text-red-400">
-                {{ previewError }}
-              </div>
-              <!-- 预览提示（自动预览 / 手动预览） -->
-              <div v-if="previewHint || previewItems.length > 0" class="flex items-center gap-2">
-                <p class="text-xs text-[hsl(var(--muted-foreground))]">
-                  {{ previewHint || `已预览 ${previewTotal} 个文件` }}
-                </p>
-                <button class="text-xs text-[hsl(var(--primary))] hover:underline" @click="showPreviewModal = true">
-                  查看详情
-                </button>
-              </div>
-
+              
               <!-- 任务名称 -->
               <div>
                 <label class="mb-1.5 block text-sm font-medium text-[hsl(var(--foreground))]">任务名称</label>
@@ -1427,18 +1762,105 @@ function getTmdbPoster(item: TMDBBrief): string {
                 </div>
               </div>
 
-              <!-- 保存路径 -->
+              <!-- 分享链接 -->
               <div>
                 <label class="mb-1.5 block text-sm font-medium text-[hsl(var(--foreground))]">
-                  保存路径 <span class="text-red-500">*</span>
+                  分享链接 <span class="text-red-500">*</span>
+                  <span v-if="state.shareurl.trim() && mainLinkStatus !== 'unknown'" class="ml-1.5 rounded-full border px-1.5 py-0.5 text-[10px] font-normal" :class="statusClass(mainLinkStatus)" :title="mainLinkReason || ''">
+                    {{ statusLabel(mainLinkStatus) }}
+                  </span>
                 </label>
                 <div class="flex gap-2">
-                  <Input v-model="state.savepath" placeholder="网盘保存路径，如 /我的追剧/海贼王" class="flex-1" />
-                  <Button variant="outline" size="sm" @click="openPathBrowser">
-                    <FolderOpen class="h-4 w-4 mr-1" />
-                    浏览
+                  <Input v-model="state.shareurl" placeholder="粘贴分享链接..." class="flex-1" />
+                  <Button variant="outline" size="sm" :disabled="!state.shareurl.trim() || previewing" @click="handlePreview">
+                    <Loader2 v-if="previewing" class="h-4 w-4 animate-spin" />
+                    <Eye v-else class="h-4 w-4" />
                   </Button>
                 </div>
+              </div>
+
+              <!-- 备用分享链接：主链接失效时自动切换 -->
+              <div class="rounded-md border border-[hsl(var(--border))] px-3 py-2">
+                <div class="flex items-center justify-between gap-2">
+                  <button class="flex items-center gap-1 text-sm font-medium text-[hsl(var(--foreground))]" @click="backupOpen = !backupOpen">
+                    <component :is="backupOpen ? ChevronUp : ChevronDown" class="h-3.5 w-3.5 text-[hsl(var(--muted-foreground))]" />
+                    多源链接
+                    <span v-if="backupLinks.length" class="rounded-full border border-[hsl(var(--primary))] px-1.5 text-[10px] text-[hsl(var(--primary))]">{{ backupLinks.length }}/{{ MAX_BACKUP_LINKS }}</span>
+                  </button>
+                  <div class="flex items-center gap-1">
+                    <Button size="sm" variant="ghost" class="h-7 text-xs" :disabled="!state.shareurl.trim() || backupChecking" @click="checkAllShareLinks">
+                      <Loader2 v-if="backupChecking" class="mr-1 h-3 w-3 animate-spin" />
+                      验证全部
+                    </Button>
+                    <Button size="sm" variant="ghost" class="h-7 text-xs" :disabled="!state.shareurl.trim() || backupLinks.length >= MAX_BACKUP_LINKS" @click="openResourceSearchForBackup('backup')">
+                      <Search class="mr-1 h-3 w-3" /> 搜索添加
+                    </Button>
+                  </div>
+                </div>
+                <div v-if="backupOpen" class="mt-2 space-y-2">
+                  <p class="text-xs text-[hsl(var(--muted-foreground))]">每次运行按下表顺序依次对全部链接做一次转存，哪条内容先更新就先被转存。<span class="text-[hsl(var(--foreground))]">顺序 = 转存优先级</span>：同一集多源都有时，靠前的源先转存，靠后的因去重自动跳过（把画质/命名更好的源放在前面）。已标失效的链接不再请求；需与主链接同网盘类型；添加时自动定位一次</p>
+                  <div v-if="!backupLinks.length" class="py-1 text-xs text-[hsl(var(--muted-foreground))]">暂无其它源链接</div>
+                  <div
+                    v-for="(row, idx) in backupLinks"
+                    :key="idx"
+                    class="flex items-center gap-1.5 rounded border border-[hsl(var(--border))] px-2 py-1.5"
+                  >
+                    <span class="w-4 shrink-0 text-center text-[10px] text-[hsl(var(--muted-foreground))]" :title="`转存优先级 ${idx + 2}（主链接为 1）`">{{ idx + 2 }}</span>
+                    <Input
+                      v-model="row.url"
+                      class="h-7 min-w-0 flex-1 text-xs"
+                      placeholder="分享链接"
+                      :title="row.url"
+                      @focus="backupEditSnapshot = row.url"
+                      @change="onBackupUrlEdited(idx, backupEditSnapshot)"
+                      @keydown.enter.prevent="onBackupUrlEdited(idx, backupEditSnapshot)"
+                    />
+                    <span v-if="row.locating" class="inline-flex shrink-0 items-center gap-0.5 text-[10px] text-[hsl(var(--muted-foreground))]">
+                      <Loader2 class="h-3 w-3 animate-spin" /> 定位中
+                    </span>
+                    <span v-else class="shrink-0 rounded-full border px-1.5 text-[10px]" :class="statusClass(row.status)" :title="row.reason || ''">{{ statusLabel(row.status) }}</span>
+                    <button class="icon-action h-6 w-6 shrink-0" title="上移（提高转存优先级）" :disabled="idx === 0" @click="moveBackupLink(idx, -1)">
+                      <ArrowUp class="h-3 w-3" />
+                    </button>
+                    <button class="icon-action h-6 w-6 shrink-0" title="下移（降低转存优先级）" :disabled="idx === backupLinks.length - 1" @click="moveBackupLink(idx, 1)">
+                      <ArrowDown class="h-3 w-3" />
+                    </button>
+                    <button class="icon-action h-6 w-6 shrink-0" title="自动定位文件夹" :disabled="row.locating" @click="locateBackupLink(row)">
+                      <Folder class="h-3 w-3" />
+                    </button>
+                    <button class="icon-action h-6 w-6 shrink-0" title="预览内容（可选目录）" @click="openBackupPreview(row)">
+                      <Eye class="h-3 w-3" />
+                    </button>
+                    <button class="icon-action h-6 w-6 shrink-0" title="搜索换链" @click="openResourceSearchForBackup(`replace:${idx}`)">
+                      <Search class="h-3 w-3" />
+                    </button>
+                    <button class="icon-action h-6 w-6 shrink-0" :title="isEditing ? '设为主链接（优先级提到第 1；已保存的链接立即生效）' : '设为主链接（优先级提到第 1）'" :disabled="promotingIndex === idx" @click="promoteBackupLink(idx)">
+                      <Loader2 v-if="promotingIndex === idx" class="h-3 w-3 animate-spin" />
+                      <Check v-else class="h-3 w-3" />
+                    </button>
+                    <button class="icon-action h-6 w-6 shrink-0" title="删除" @click="removeBackupLink(idx)">
+                      <X class="h-3 w-3" />
+                    </button>
+                  </div>
+                  <div class="flex gap-2">
+                    <Input v-model="backupInput" placeholder="手动粘贴分享链接..." class="flex-1 text-xs" :disabled="backupLinks.length >= MAX_BACKUP_LINKS" @keydown.enter.prevent="addBackupFromInput" />
+                    <Button size="sm" variant="outline" :disabled="!backupInput.trim() || backupLinks.length >= MAX_BACKUP_LINKS" @click="addBackupFromInput">添加</Button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 预览错误 -->
+              <div v-if="previewError" class="rounded-md bg-red-50 p-3 text-sm text-red-600 dark:bg-red-950/30 dark:text-red-400">
+                {{ previewError }}
+              </div>
+              <!-- 预览提示（自动预览 / 手动预览） -->
+              <div v-if="previewHint || previewItems.length > 0" class="flex items-center gap-2">
+                <p class="text-xs text-[hsl(var(--muted-foreground))]">
+                  {{ previewHint || `已预览 ${previewTotal} 个文件` }}
+                </p>
+                <button class="text-xs text-[hsl(var(--primary))] hover:underline" @click="showPreviewModal = true">
+                  查看详情
+                </button>
               </div>
 
               <!-- 账号选择 -->
@@ -1455,6 +1877,19 @@ function getTmdbPoster(item: TMDBBrief): string {
                 </select>
               </div>
 
+              <!-- 保存路径 -->
+              <div>
+                <label class="mb-1.5 block text-sm font-medium text-[hsl(var(--foreground))]">
+                  保存路径 <span class="text-red-500">*</span>
+                </label>
+                <div class="flex gap-2">
+                  <Input v-model="state.savepath" placeholder="网盘保存路径，如 /我的追剧/海贼王" class="flex-1" />
+                  <Button variant="outline" size="sm" @click="openPathBrowser">
+                    <FolderOpen class="h-4 w-4 mr-1" />
+                    浏览
+                  </Button>
+                </div>
+              </div>
               <!-- 115自动换链（仅115驱动时显示） -->
               <label v-if="currentDriveType() === '115'" class="flex items-center gap-2 text-sm text-[hsl(var(--foreground))] cursor-pointer">
                 <input v-model="state.auto_update_115_shareurl" type="checkbox" class="h-4 w-4 rounded border-[hsl(var(--border))] text-[hsl(var(--primary))]" />
@@ -1857,7 +2292,21 @@ function getTmdbPoster(item: TMDBBrief): string {
       :initial-query="resourceSearchQuery"
       :drive-type="resourceSearchDriveType"
       :drive-types="resourceSearchDriveTypes"
+      :multi-select="true"
+      :actions="resourceSearchActions"
+      :preview-context="sharePreviewContext"
       @select="onResourceSelected"
+      @action="onResourceAction"
+    />
+
+    <!-- 备用链接预览：与主链接预览一致（可刷新/导航/选目录），选目录写回该条备用链接 -->
+    <SharePreviewDialog
+      v-model:visible="backupPreviewVisible"
+      :shareurl="backupPreviewUrl"
+      :readonly="false"
+      :preview-context="sharePreviewContext"
+      :z-index="110"
+      @pick-folder="onPickBackupFolder"
     />
   </Teleport>
 </template>

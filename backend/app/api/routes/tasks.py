@@ -51,6 +51,11 @@ from app.schemas.task import (
     TaskCreateIn,
     TaskExecutionOut,
     TaskOut,
+    TaskShareUrlActivateIn,
+    TaskShareUrlOut,
+    TaskShareUrlsCheckIn,
+    TaskShareUrlsCheckItemOut,
+    TaskShareUrlsCheckOut,
     TaskStatusIn,
     TaskUpdateIn,
 )
@@ -67,6 +72,7 @@ from app.services.drive_browse import browse_drive_directory
 from app.services.drama_update_progress import build_drama_update_progress
 from app.services.drama_share_repair import repair_banned_drama_tasks
 from app.services.task_scheduler import get_or_create_task_scheduler_setting, update_task_scheduler_setting
+from app.services.task_share_links import check_task_share_links, load_share_links, promote_link
 from app.services.resource_search import fetch_task_suggestions, verify_task_suggestions
 from app.services.tasks import create_task, delete_task, get_task, list_tasks_recent_executions, set_task_enabled, update_task
 from app.services.tmdb_settings import get_or_create_tmdb_setting, get_tmdb_runtime_config
@@ -338,6 +344,18 @@ def _task_out(
         account_name=item.account_name,
         update_subdir=item.update_subdir,
         shareurl_ban=getattr(item, "shareurl_ban", None),
+        shareurls=[
+            TaskShareUrlOut(
+                url=link["url"],
+                status=str(link.get("status") or "unknown"),
+                reason=link.get("reason"),
+                last_checked_at=link.get("last_checked_at"),
+                added_at=link.get("added_at"),
+                source=link.get("source"),
+                is_active=link["url"] == str(item.shareurl or "").strip(),
+            )
+            for link in load_share_links(item)
+        ],
         tmdb_id=getattr(item, "tmdb_id", None),
         tmdb_media_type=getattr(item, "tmdb_media_type", None),
         tmdb_status=tmdb_status,
@@ -1051,9 +1069,11 @@ def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, cur
                 # 带 task_uid 且已存在的任务：用真实任务行（持久化执行记录），以便失败时写封禁+触发自动修复、
                 # 成功时触发115自动换链；无 task_uid（新建任务试跑）仍走临时任务不落库
                 existing_task_id = 0
+                existing_shareurl_list_json: str | None = None
                 if str(payload.task_uid or "").strip():
                     row = wdb.execute(select(Task).where(Task.task_uid == task_uid)).scalars().first()
                     existing_task_id = int(getattr(row, "id", 0) or 0)
+                    existing_shareurl_list_json = getattr(row, "shareurl_list_json", None) if row is not None else None
                 wtask = Task(
                     task_uid=task_uid,
                     task_type=str(payload.task_type or "generic"),
@@ -1074,6 +1094,19 @@ def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, cur
                     addition_json=json.dumps(payload.addition or {}, ensure_ascii=False),
                     extra_json=json.dumps(payload.extra or {}, ensure_ascii=False),
                 )
+                # 多源链接来源优先级：payload 显式传入 > 已保存任务的链接列表。
+                # 卡片“运行一次”等调用方的 payload 不带 shareurls，必须从库里取，否则会退化为只跑主链接
+                payload_shareurls = [str(x or "").strip() for x in (getattr(payload, "shareurls", None) or []) if str(x or "").strip()]
+                if payload_shareurls:
+                    from app.services.task_share_links import new_link as _new_share_link
+
+                    if not str(wtask.shareurl or "").strip():
+                        wtask.shareurl = payload_shareurls[0]
+                    wtask.shareurl_list_json = json.dumps(
+                        [_new_share_link(u) for u in payload_shareurls], ensure_ascii=False
+                    )
+                elif existing_shareurl_list_json:
+                    wtask.shareurl_list_json = existing_shareurl_list_json
                 wtask.id = existing_task_id
                 wdb.close()
                 execution = TaskExecutor(db=None).run_task(
@@ -1218,6 +1251,55 @@ def patch_task_scheduler_setting(request: Request, payload: TaskSchedulerSetting
 def post_repair_banned_tasks(db: Session = Depends(get_db)) -> RepairBannedTasksOut:
     result = repair_banned_drama_tasks(db)
     return RepairBannedTasksOut(**(result or {}))
+
+
+@router.post('/{task_id:int}/shareurls/check', response_model=TaskShareUrlsCheckOut, dependencies=[Depends(require_permissions(TASK_WRITE))])
+def post_check_task_shareurls(
+    request: Request,
+    task_id: int,
+    payload: TaskShareUrlsCheckIn | None = None,
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    task = get_task(db, task_id)
+    results = check_task_share_links(db, task, shareurls=(payload.shareurls if payload is not None else None))
+    audit.write_audit_log(
+        db,
+        actor_user_id=current.user.id,
+        action='task.shareurls_check',
+        target_type='task',
+        target_id=str(task_id),
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get('user-agent'),
+        success=True,
+        detail=f"checked={len(results)}, valid={sum(1 for x in results if x['ok'])}",
+    )
+    db.commit()
+    return TaskShareUrlsCheckOut(items=[TaskShareUrlsCheckItemOut(**x) for x in results])
+
+
+@router.post('/{task_id:int}/shareurls/activate', response_model=TaskOut, dependencies=[Depends(require_permissions(TASK_WRITE))])
+def post_activate_task_shareurl(request: Request, task_id: int, payload: TaskShareUrlActivateIn, current: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
+    task = get_task(db, task_id)
+    url = str(payload.shareurl or "").strip()
+    known = {x["url"] for x in load_share_links(task)}
+    if url not in known:
+        raise bad_request('TASK_SHAREURL_NOT_IN_LIST', '指定链接不在任务的分享链接列表中')
+    promote_link(db, task_id, url)
+    audit.write_audit_log(
+        db,
+        actor_user_id=current.user.id,
+        action='task.shareurl_switch',
+        target_type='task',
+        target_id=str(task_id),
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get('user-agent'),
+        success=True,
+        detail=f"手动切换主链接：{url}",
+    )
+    db.commit()
+    db.refresh(task)
+    return _task_out(db, task)
 
 
 @router.post('/share/preview', response_model=SharePreviewOut, dependencies=[Depends(require_permissions(TASK_READ))])

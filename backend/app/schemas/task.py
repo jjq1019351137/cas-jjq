@@ -10,6 +10,7 @@ class TaskBase(BaseModel):
     task_type: str = Field(default="generic", max_length=32)
     taskname: str = Field(min_length=1, max_length=255)
     shareurl: str = Field(min_length=1)
+    shareurls: list[str] | None = None
     savepath: str = Field(min_length=1, max_length=255)
     sync_task_uids: list[str] | None = None
     pattern: str | None = Field(default=None, max_length=255)
@@ -35,6 +36,7 @@ class TaskUpdateIn(BaseModel):
     task_type: str | None = Field(default=None, max_length=32)
     taskname: str | None = Field(default=None, min_length=1, max_length=255)
     shareurl: str | None = None
+    shareurls: list[str] | None = None
     savepath: str | None = Field(default=None, min_length=1, max_length=255)
     sync_task_uids: list[str] | None = None
     pattern: str | None = Field(default=None, max_length=255)
@@ -54,6 +56,36 @@ class TaskUpdateIn(BaseModel):
 
 class TaskStatusIn(BaseModel):
     enabled: bool
+
+
+class TaskShareUrlOut(BaseModel):
+    url: str
+    status: str = "unknown"
+    reason: str | None = None
+    last_checked_at: str | None = None
+    added_at: str | None = None
+    source: str | None = None
+    is_active: bool = False
+
+
+class TaskShareUrlsCheckItemOut(BaseModel):
+    url: str
+    ok: bool
+    message: str | None = None
+    status: str = "unknown"
+    latest_video: dict[str, Any] | None = None
+
+
+class TaskShareUrlsCheckOut(BaseModel):
+    items: list[TaskShareUrlsCheckItemOut] = []
+
+
+class TaskShareUrlsCheckIn(BaseModel):
+    shareurls: list[str] | None = None
+
+
+class TaskShareUrlActivateIn(BaseModel):
+    shareurl: str = Field(min_length=1)
 
 
 class TaskExecutionOut(BaseModel):
@@ -99,6 +131,7 @@ class TaskOut(BaseModel):
     account_name: str | None = None
     update_subdir: str | None = None
     shareurl_ban: str | None = None
+    shareurls: list[TaskShareUrlOut] = []
     tmdb_id: int | None = None
     tmdb_media_type: str | None = None
     tmdb_status: str | None = None

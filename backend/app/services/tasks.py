@@ -14,8 +14,14 @@ from app.models.sync_task import SyncTask
 from app.models.sync_task_drama_link import SyncTaskDramaLink
 from app.models.task import Task
 from app.models.task_execution import TaskExecution
+from app.services.task_share_links import load_share_links, set_share_links_from_urls
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_shareurls(value: list[str] | None) -> list[str]:
+    urls = [str(x or "").strip() for x in (value or [])]
+    return list(dict.fromkeys(x for x in urls if x))
 
 
 def _normalize_uids(value: list[str] | None) -> list[str]:
@@ -116,6 +122,11 @@ def get_task(db: Session, task_id: int) -> Task:
 
 
 def create_task(db: Session, **payload) -> Task:
+    shareurls = _normalize_shareurls(payload.get("shareurls"))
+    if shareurls:
+        if str(payload.get("task_type") or "generic") != "drama" and len(shareurls) > 1:
+            raise bad_request("TASK_SHAREURLS_NOT_ALLOWED", "仅追剧任务支持多个分享链接")
+        payload["shareurl"] = shareurls[0]
     drive_type = AdapterRegistry.detect_drive_type(payload['shareurl'])
     if drive_type is None:
         raise bad_request('TASK_SHAREURL_INVALID', '无法识别的网盘分享链接')
@@ -164,6 +175,8 @@ def create_task(db: Session, **payload) -> Task:
     )
     db.add(task)
     db.flush()
+    if shareurls:
+        set_share_links_from_urls(db, task, shareurls)
     sync_task_uids = payload.get("sync_task_uids")
     if str(getattr(task, "task_type", "") or "") == "drama":
         if sync_task_uids is not None:
@@ -178,6 +191,7 @@ def update_task(db: Session, task_id: int, **payload) -> Task:
     task = get_task(db, task_id)
     sync_task_uids_present = "sync_task_uids" in payload
     sync_task_uids = payload.get("sync_task_uids") if sync_task_uids_present else None
+    shareurls = _normalize_shareurls(payload.get("shareurls")) if payload.get("shareurls") is not None else None
     task.shareurl_ban = None
     old_shareurl = str(getattr(task, "shareurl", "") or "").strip()
     clearable_fields = {'pattern', 'replace', 'enddate', 'sort_index', 'startfid', 'account_name', 'update_subdir', 'tmdb_id', 'tmdb_media_type'}
@@ -233,6 +247,20 @@ def update_task(db: Session, task_id: int, **payload) -> Task:
         new_shareurl = str(getattr(task, "shareurl", "") or "").strip()
         if new_shareurl and new_shareurl != old_shareurl:
             task.shareurl_ban = None
+
+    if shareurls is not None:
+        if not shareurls:
+            raise bad_request("TASK_SHAREURLS_EMPTY", "分享链接列表不能为空")
+        if str(getattr(task, "task_type", "") or "") != "drama" and len(shareurls) > 1:
+            raise bad_request("TASK_SHAREURLS_NOT_ALLOWED", "仅追剧任务支持多个分享链接")
+        set_share_links_from_urls(db, task, shareurls)
+    elif "shareurl" in payload and str(getattr(task, "task_type", "") or "") == "drama":
+        active = str(getattr(task, "shareurl", "") or "").strip()
+        if active:
+            active_dt = AdapterRegistry.detect_drive_type(active)
+            existing = [x["url"] for x in load_share_links(task)]
+            kept = [u for u in existing if u != active and AdapterRegistry.detect_drive_type(u) == active_dt]
+            set_share_links_from_urls(db, task, [active] + kept)
 
     if "task_type" in payload and str(getattr(task, "task_type", "") or "") != "drama":
         db.query(SyncTaskDramaLink).filter(SyncTaskDramaLink.task_uid == str(task.task_uid)).delete(synchronize_session=False)

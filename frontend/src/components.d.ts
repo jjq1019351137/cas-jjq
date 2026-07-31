@@ -53,6 +53,7 @@ declare module 'vue' {
     RouterView: typeof import('vue-router')['RouterView']
     SettingCard: typeof import('./components/ui/setting-card/SettingCard.vue')['default']
     ShareLinkCachePanel: typeof import('./components/business/settings/cache/ShareLinkCachePanel.vue')['default']
+    SharePreviewDialog: typeof import('./components/business/drama/SharePreviewDialog.vue')['default']
     Sheet: typeof import('./components/ui/sheet/Sheet.vue')['default']
     Sidebar: typeof import('./components/layout/Sidebar.vue')['default']
     Skeleton: typeof import('./components/ui/skeleton/Skeleton.vue')['default']
