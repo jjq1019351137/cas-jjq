@@ -38,6 +38,11 @@ def should_trigger_linked_sync_for_drama_execution(execution: object | None) -> 
         return False
     if str(getattr(execution, "status", "") or "") != "success":
         return False
+    # 多链接模式下 tree_summary 是各链接树的合并文本，只要任一链接无新文件就包含
+    # “无可转存文件”，文本启发式会误判。优先使用基于 transfer_count 的权威标志。
+    has_new = getattr(execution, "_has_new_files", None)
+    if has_new is not None:
+        return bool(has_new)
     tree_summary = str(getattr(execution, "tree_summary", "") or "")
     if "无可转存文件" in tree_summary:
         return False
