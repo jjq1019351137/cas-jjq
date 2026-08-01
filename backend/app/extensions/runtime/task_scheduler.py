@@ -23,7 +23,7 @@ from app.services.drama_share_repair import repair_banned_drama_tasks
 from app.services.tmdb_cache import purge_cold_cache, refresh_expired_cache, refresh_linked_tasks
 from app.services.tmdb_cache_scheduler import get_or_create_tmdb_cache_scheduler_setting
 from app.services.drive_account_probe_scheduler import get_or_create_drive_account_probe_scheduler_setting
-from app.services.drive_accounts import probe_drive_account, sign_in_drive_account
+from app.services.drive_accounts import is_transient_probe_error, probe_drive_account, sign_in_drive_account
 from app.services.drama_linked_pipeline import DramaLinkedBatchItem, run_drama_linked_batch_pipeline
 from app.services.sync_execution_cleanup import purge_old_sync_executions
 from app.services.sync_execution_recovery import abort_stale_running_sync_executions
@@ -528,10 +528,16 @@ def run_drive_account_probe() -> None:
                         prev_status = getattr(account, "runtime_status", None) if account is not None else None
                         prev_enabled = bool(getattr(account, "enabled", True)) if account is not None else True
                         if account is not None:
-                            account.runtime_status = "inactive"
-                            account.last_error = str(exc)
+                            # 网络/服务端抖动不降级状态，否则一次探测异常就使账号在各选号链路不可用，
+                            # 绕过了 probe 里「累计多次才禁用」的阈值语义
+                            transient = is_transient_probe_error(exc)
+                            if not transient:
+                                account.runtime_status = "inactive"
+                            account.last_error = (
+                                f"网络或接口暂时异常（未降级状态）：{exc}" if transient else str(exc)
+                            )
                             db.commit()
-                            if prev_enabled or prev_status == "active":
+                            if not transient and (prev_enabled or prev_status == "active"):
                                 lines = [
                                     "驱动账号状态异常",
                                     "触发: 自动探测",

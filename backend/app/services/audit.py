@@ -98,6 +98,7 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "task.drama.stop_completed": ("task", "停止完结剧"),
     "task.drama.sync_savepath_snapshots": ("task", "同步保存路径快照"),
     "task.shareurl_repair": ("task", "修复失效分享链接"),
+    "task.shareurl_switch": ("task", "切换主分享链接"),
     "task.shareurl_autoupdate": ("task", "自动换链"),
     # 同步任务
     "sync_task.create": ("sync_task", "创建同步任务"),

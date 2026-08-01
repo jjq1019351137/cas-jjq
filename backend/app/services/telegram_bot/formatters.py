@@ -60,6 +60,24 @@ def _emoji_verify(value: Any) -> str:
     return "❔"
 
 
+def share_link_status_icon(status: Any) -> str:
+    text = str(status or "").strip().lower()
+    if text == "ok":
+        return "✅"
+    if text == "invalid":
+        return "❌"
+    return "❔"
+
+
+def share_link_status_label(status: Any) -> str:
+    text = str(status or "").strip().lower()
+    if text == "ok":
+        return "可用"
+    if text == "invalid":
+        return "失效"
+    return "未验证"
+
+
 def _short_text(value: Any, limit: int = 72) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -179,6 +197,25 @@ def tasks_message(payload: dict[str, Any], *, title: str = "任务列表") -> st
     return truncate("\n".join(lines))
 
 
+def _task_share_link_lines(item: dict[str, Any]) -> list[str]:
+    """多链接展示：首行为主链接，其余为备用链接（顺序即转存优先级）。"""
+    active = str(item.get("shareurl") or "").strip()
+    links = [x for x in (item.get("shareurls") or []) if str(x.get("url") or "").strip()]
+    backups = [x for x in links if str(x.get("url") or "").strip() != active]
+    active_row = next((x for x in links if str(x.get("url") or "").strip() == active), None)
+    lines = [f"🔗 分享链接: 主链接 + 备用 {len(backups)} 条"]
+    lines.append(f"⭐ {share_link_status_icon((active_row or {}).get('status'))} {_short_text(active or '-', 84)}")
+    active_reason = str((active_row or {}).get("reason") or "").strip()
+    if active_reason:
+        lines.append(f"   ⚠️ {_short_text(active_reason, 68)}")
+    for idx, row in enumerate(backups):
+        lines.append(f"#{idx + 1} {share_link_status_icon(row.get('status'))} {_short_text(row.get('url'), 84)}")
+        reason = str(row.get("reason") or "").strip()
+        if reason:
+            lines.append(f"   ⚠️ {_short_text(reason, 68)}")
+    return lines
+
+
 def task_detail_message(item: dict[str, Any]) -> str:
     execution = item.get("latest_execution") or {}
     linked_sync = item.get("sync_task_names") or item.get("sync_task_uids") or []
@@ -199,7 +236,8 @@ def task_detail_message(item: dict[str, Any]) -> str:
         "",
         f"🚦 最近执行: {exec_status}",
         f"📣 执行说明: {exec_message}",
-        f"🔗 分享链接: {_short_text(item.get('shareurl') or '-', 88)}",
+        "",
+        *_task_share_link_lines(item),
     ]
     return truncate("\n".join(lines))
 
@@ -211,7 +249,8 @@ def task_detail_keyboard(task_id: int, enabled: bool, *, back_page: int = 1, tas
         [
             [button("▶️ 运行", "tsk", "run", task_id), button(toggle_text, "tsk", "toggle", task_id)],
             [button("✏️ 编辑", "tsk", "edit", task_id), button("🔎 搜索换链", "tsk", "search", task_id)],
-            [button("🧾 执行记录", "tsk", "execs", task_id), button("🗑️ 删除", "tsk", "delete", task_id)],
+            [button("🔗 校验链接", "tsk", "checklinks", task_id), button("🧾 执行记录", "tsk", "execs", task_id)],
+            [button("🗑️ 删除", "tsk", "delete", task_id)],
             [list_button, button("🏠 首页", "home")],
         ]
     )
@@ -588,7 +627,7 @@ def search_results_keyboard(total: int, *, page: int, page_size: int, replace_mo
     end = min(total, start + page_size)
     for idx in range(start, end):
         if replace_mode:
-            rows.append([button(f"🔁 选第 {idx + 1} 条", "sea", "replace", idx)])
+            rows.append([button(f"🔁 换主链接 {idx + 1}", "sea", "replace", idx), button(f"➕ 加为备用 {idx + 1}", "sea", "append", idx)])
         else:
             rows.append([button(f"➕ 选第 {idx + 1} 条", "sea", "create", idx)])
     rows.append(pagination_row("sea:list", page, total, page_size))

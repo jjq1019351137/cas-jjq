@@ -38,6 +38,7 @@ from app.services.drive_account_lsdir_static_state import (
     should_rescan_static_path,
 )
 from app.services import drive_account_lsdir_refresh_status as refresh_status
+from app.services.drive_accounts import utc_naive_now
 from app.services.dl302_settings import (
     extract_dl302_cache_base_path,
     extract_dl302_static_cache_base_path,
@@ -1111,7 +1112,9 @@ def _refresh_account_paths(
             _wait_for_account_rate_limit(int(account_id), rate_limit)
             listing = adapter.ls_dir(str(parent_fid), max_items=0) or {}
             raw_items = _extract_listing_items("ls_dir", listing)
-            now = datetime.now()
+            # scanned_at 经 normalize_api_datetime 输出为 lsdir_cache_updated_at，
+            # 必须与库内「UTC naive」约定一致，写本地时间会被误当 UTC 而多加时区偏移
+            now = utc_naive_now()
             with SessionLocal() as db:
                 normalized_items = upsert_drive_account_lsdir_items(
                     db,

@@ -21,6 +21,111 @@ from app.thirdparty.dl302_grpc_client import list_cloud189_families as list_clou
 BEIJING_TZ = ZoneInfo('Asia/Shanghai')
 
 
+def utc_naive_now() -> datetime:
+    """当前 UTC 时间（naive），供经 normalize_api_datetime 输出的时间字段写入。
+
+    库内时间列的统一语义是「UTC naive」（与 server_default=func.now() 在 SQLite 下一致），
+    normalize_api_datetime 也是按这个语义把 naive 值当 UTC 再转北京时间。
+    若此处写 datetime.now()（本地 naive），会被误当成 UTC 而多加一个时区偏移（东八区 +8h）。
+    SQLite 读回时会丢弃 tzinfo，因此不能靠写入 aware 时间规避。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+# 探测连续失败达到该次数才禁用账号
+PROBE_FAIL_DISABLE_THRESHOLD = 3
+
+# 可重试的网络/服务端抖动特征：这类失败不代表凭证失效，不应首次就把账号降级
+TRANSIENT_PROBE_ERROR_PATTERNS = (
+    "timeout",
+    "timed out",
+    "connection aborted",
+    "connection reset",
+    "connection refused",
+    "connectionerror",
+    "connectionreseterror",
+    "max retries exceeded",
+    "failed to establish a new connection",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname",
+    "remote end closed connection",
+    "bad gateway",
+    "service unavailable",
+    "gateway time-out",
+    "gateway timeout",
+    "internal server error",
+    "too many requests",
+    "ssl",
+    "proxyerror",
+    "read timed out",
+    "连接超时",
+    "请求超时",
+    "网络异常",
+    "网络错误",
+    "服务器错误",
+    "稍后重试",
+    "过于频繁",
+    "请求频繁",
+)
+
+# 凭证失效特征：即使包含网络关键词也必须立即标记异常，避免遮蔽真实的登录失效
+AUTH_PROBE_ERROR_PATTERNS = (
+    "unauthenticated",
+    "unauthorized",
+    "forbidden",
+    "invalid token",
+    "token expired",
+    "refreshtokenexpired",
+    "accesstokeninvalid",
+    "未登录",
+    "登录已过期",
+    "登录失效",
+    "登录过期",
+    "cookie失效",
+    "cookie 失效",
+    "cookie已过期",
+    "认证失败",
+    "重新登录",
+    "密码错误",
+    "账号或密码",
+)
+
+
+def is_transient_probe_error(exc: BaseException) -> bool:
+    """判定探测异常是否属于可恢复的网络/服务端抖动。
+
+    适配器常将底层错误包成 RuntimeError，因此同时看异常类型与文本特征；
+    一旦命中凭证失效特征则不归为网络问题，以免真实登录失效被延迟发现。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(token in text for token in AUTH_PROBE_ERROR_PATTERNS):
+        return False
+    try:
+        import requests
+
+        if isinstance(
+            exc,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.SSLError,
+                requests.exceptions.ProxyError,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        ):
+            return True
+        if isinstance(exc, requests.exceptions.HTTPError):
+            status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+            if status in (408, 429) or 500 <= status <= 599:
+                return True
+    except Exception:
+        pass
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return any(token in text for token in TRANSIENT_PROBE_ERROR_PATTERNS)
+
+
+
 @dataclass(slots=True)
 class DriveAccountSnapshot:
     id: int
@@ -364,7 +469,7 @@ def _probe_drive_account_snapshot(snapshot: DriveAccountSnapshot) -> DriveAccoun
     runtime_config = AdapterRegistry.parse_config_json(snapshot.drive_type, snapshot.config_json, snapshot.cookie)
     runtime_cookie = AdapterRegistry.serialize_config(snapshot.drive_type, runtime_config)
     cookie_value = runtime_cookie if runtime_cookie else snapshot.cookie
-    last_checked_at = datetime.now()
+    last_checked_at = utc_naive_now()
     adapter = AdapterFactory.create_adapter(
         snapshot.drive_type,
         runtime_cookie,
@@ -376,6 +481,7 @@ def _probe_drive_account_snapshot(snapshot: DriveAccountSnapshot) -> DriveAccoun
     last_error: str | None = "驱动实例创建失败"
     config_json_value = snapshot.config_json
     profile_json_value: str | None = None
+    transient_failure = False
 
     if adapter is not None:
         try:
@@ -424,13 +530,22 @@ def _probe_drive_account_snapshot(snapshot: DriveAccountSnapshot) -> DriveAccoun
         except Exception as exc:
             runtime_status = "error"
             last_error = str(exc)
+            transient_failure = is_transient_probe_error(exc)
 
     if ok:
         probe_fail_count = 0
         enabled = snapshot.enabled
     else:
         probe_fail_count = int(snapshot.probe_fail_count or 0) + 1
-        enabled = snapshot.enabled and probe_fail_count < 3
+        enabled = snapshot.enabled and probe_fail_count < PROBE_FAIL_DISABLE_THRESHOLD
+        # 网络/服务端抖动在未达禁用阈值前不降级状态：
+        # runtime_status 非 active 会让账号在任务选号、资源搜索、lsdir 扫描等处被直接过滤，
+        # 等同于首次报错就不可用，与「累计 3 次才禁用」的预期不一致。
+        if transient_failure and probe_fail_count < PROBE_FAIL_DISABLE_THRESHOLD:
+            runtime_status = str(snapshot.runtime_status or "") or runtime_status
+            last_error = (
+                f"网络或接口暂时异常（第 {probe_fail_count}/{PROBE_FAIL_DISABLE_THRESHOLD} 次，未禁用）：{last_error}"
+            )
 
     return DriveAccountProbeOutcome(
         runtime_status=runtime_status,

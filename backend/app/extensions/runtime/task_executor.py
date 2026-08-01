@@ -320,6 +320,19 @@ class TaskExecutor:
         
         original_startfid = str(task_data.get("startfid") or "").strip()
 
+        # 本次运行前已是 invalid 的链接：全部链接都失效时 pick_run_link_candidates 会回退为重试活跃链接，
+        # 仅对「本次新失效」的链接发通知，避免同一条失效链接每轮调度重复推送
+        previously_invalid: set[str] = set()
+        if task_id > 0:
+            try:
+                previously_invalid = {
+                    str(x.get("url") or "").strip()
+                    for x in load_share_links(task)
+                    if str(x.get("status") or "") == STATUS_INVALID
+                }
+            except Exception:
+                previously_invalid = set()
+
         trees: list[Tree] = []
         summaries: list[str] = []
         transfer_total = 0
@@ -329,6 +342,7 @@ class TaskExecutor:
         last_exc: Exception | None = None
         last_stage = ""
         last_message = ""
+        newly_invalid_links: list[dict[str, str]] = []
 
         for index, url in enumerate(candidates, start=1):
             task_data["shareurl"] = url
@@ -358,6 +372,8 @@ class TaskExecutor:
                         )
                     except Exception:
                         logger.warning("标记失效链接状态失败 task_id=%s url=%s", task_id, url)
+                    if url not in previously_invalid:
+                        newly_invalid_links.append({"url": url, "reason": f"阶段={stage}：{message}"})
                 log.line(f"FAIL: 阶段={stage} {message}")
                 if index < total:
                     log.line("继续处理下一条链接")
@@ -382,6 +398,11 @@ class TaskExecutor:
                 except Exception:
                     logger.warning("标记可用链接状态失败 task_id=%s url=%s", task_id, url)
 
+        # 在 not trees 提前抛异常之前先落存，使「全部链接失败」的执行也能带上失效链接明细
+        setattr(task, "_runtime_invalid_links", newly_invalid_links)
+        setattr(task, "_runtime_link_total", total)
+        setattr(task, "_runtime_link_ok_count", ok_count)
+
         if not trees:
             log.set_stage(last_stage or "execute_drama")
             raise last_exc if last_exc is not None else RuntimeError("没有可用的分享链接")
@@ -404,6 +425,13 @@ class TaskExecutor:
         if len(summaries) > 1:
             setattr(merged, "_combined_summary", "\n\n".join(summaries))
         return merged
+
+    def _attach_link_runtime_meta(self, execution: Any, task: Any) -> None:
+        """把多链接运行明细搬到 execution，供通知层（build_task_section）读取。"""
+        raw = getattr(task, "_runtime_invalid_links", None)
+        setattr(execution, "_invalid_links", list(raw) if isinstance(raw, list) else [])
+        setattr(execution, "_link_total", int(getattr(task, "_runtime_link_total", 0) or 0))
+        setattr(execution, "_link_ok_count", int(getattr(task, "_runtime_link_ok_count", 0) or 0))
 
     def run_task(
         self,
@@ -1065,6 +1093,7 @@ class TaskExecutor:
                 setattr(execution, "_runtime_tree", getattr(task, "_runtime_tree", None))
             setattr(execution, "_runtime_task_data", getattr(task, "_runtime_task_data", None))
             setattr(execution, "_runtime_adapter", getattr(task, "_runtime_adapter", None))
+            self._attach_link_runtime_meta(execution, task)
             return execution
         self._persist_execution_detached(execution)
         setattr(execution, "_snapshot_row_id", snapshot_row_id)
@@ -1073,4 +1102,5 @@ class TaskExecutor:
             setattr(execution, "_runtime_tree", getattr(task, "_runtime_tree", None))
         setattr(execution, "_runtime_task_data", getattr(task, "_runtime_task_data", None))
         setattr(execution, "_runtime_adapter", getattr(task, "_runtime_adapter", None))
+        self._attach_link_runtime_meta(execution, task)
         return execution

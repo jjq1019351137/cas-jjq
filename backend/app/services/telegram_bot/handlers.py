@@ -6,12 +6,14 @@ import os
 import re
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
-from app.services.telegram_bot.actions import TelegramBotActions
+from app.extensions.runtime.adapter_registry import AdapterRegistry
+from app.services.telegram_bot.actions import MAX_BACKUP_LINKS, TelegramBotActions, share_sort_timestamp
 from app.services.telegram_bot.callbacks import parse_callback
 from app.services.telegram_bot.client import TelegramBotClient
 from app.services.telegram_bot.config import TelegramBotConfig
@@ -34,6 +36,8 @@ from app.services.telegram_bot.formatters import (
     setting_domain_message,
     settings_domains_keyboard,
     settings_domains_message,
+    share_link_status_icon,
+    share_link_status_label,
     status_message,
     sync_detail_keyboard,
     sync_detail_message,
@@ -59,6 +63,7 @@ TASK_FIELDS: list[dict[str, Any]] = [
     {"key": "task_type", "label": "任务类型", "type": "enum", "options": ["drama"], "default": "drama", "editor": False},
     {"key": "taskname", "label": "任务名称", "type": "str", "default": ""},
     {"key": "shareurl", "label": "分享链接", "type": "str", "default": ""},
+    {"key": "__share_links__", "label": "备用链接", "type": "action", "default": "", "display_key": "__share_links_label__", "transient": True},
     {"key": "__share_folder__", "label": "分享目录", "type": "action", "default": "", "display_key": "__share_folder_label__", "transient": True},
     {"key": "savepath", "label": "保存路径", "type": "str", "default": ""},
     {"key": "account_name", "label": "执行账号", "type": "str", "default": ""},
@@ -320,6 +325,94 @@ def _collapse_payload(fields: list[dict[str, Any]], draft: dict[str, Any]) -> di
             value = None
         _set_nested(payload, key, value)
     return payload
+
+
+def _new_backup_link(url: str, *, status: str = "unknown", reason: Any = None, last_checked_at: Any = None) -> dict[str, Any]:
+    return {
+        "url": str(url or "").strip(),
+        "status": str(status or "unknown"),
+        "reason": str(reason or "").strip() or None,
+        "last_checked_at": last_checked_at or None,
+    }
+
+
+def _draft_backup_links(draft: dict[str, Any]) -> list[dict[str, Any]]:
+    """草稿内的备用链接行（不含主链接）：返回可直接改动的拷贝。"""
+    rows: list[dict[str, Any]] = []
+    for item in _get_nested(draft, "__backup_links__") or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        rows.append(_new_backup_link(url, status=item.get("status"), reason=item.get("reason"), last_checked_at=item.get("last_checked_at")))
+    return rows
+
+
+def _set_draft_backup_links(draft: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    _set_nested(draft, "__backup_links__", list(rows or [])[:MAX_BACKUP_LINKS])
+
+
+def _draft_share_urls(draft: dict[str, Any]) -> list[str]:
+    """草稿的完整链接列表：主链接在首位，顺序即转存优先级。"""
+    urls = [str(_get_nested(draft, "shareurl") or "").strip()]
+    urls += [str(x.get("url") or "").strip() for x in _draft_backup_links(draft)]
+    return list(dict.fromkeys(x for x in urls if x))
+
+
+def _same_drive_type(main_url: str, url: str) -> bool:
+    main = str(main_url or "").strip()
+    if not main:
+        return True
+    main_drive_type = AdapterRegistry.detect_drive_type(main)
+    drive_type = AdapterRegistry.detect_drive_type(str(url or "").strip())
+    if main_drive_type is None or drive_type is None:
+        return False
+    return str(main_drive_type) == str(drive_type)
+
+
+def _seed_task_draft(fields: list[dict[str, Any]], source: dict[str, Any] | None = None) -> dict[str, Any]:
+    """任务草稿种子：在平铺str/bool 字段之外，额外回显多链接与主链接校验状态。"""
+    draft = _flatten_seed(fields, source)
+    item = dict(source or {})
+    active = str(_get_nested(draft, "shareurl") or "").strip()
+    links = [x for x in (item.get("shareurls") or []) if isinstance(x, dict) and str(x.get("url") or "").strip()]
+    active_row = next((x for x in links if str(x.get("url") or "").strip() == active), None)
+    _set_nested(draft, "__main_link_status__", str((active_row or {}).get("status") or "unknown"))
+    _set_nested(draft, "__main_link_reason__", (active_row or {}).get("reason") or None)
+    # 主链接已换盘时直接丢弃异盘历史链接，否则保存时会被同盘校验直接拒绝
+    _set_draft_backup_links(
+        draft,
+        [
+            _new_backup_link(
+                str(x.get("url") or "").strip(),
+                status=x.get("status"),
+                reason=x.get("reason"),
+                last_checked_at=x.get("last_checked_at"),
+            )
+            for x in links
+            if str(x.get("url") or "").strip() != active and _same_drive_type(active, str(x.get("url") or ""))
+        ],
+    )
+    return draft
+
+
+def _prune_draft_backup_links(draft: dict[str, Any]) -> int:
+    """主链接变更后清理重复与异盘备用链接，返回丢弃数量。"""
+    main = str(_get_nested(draft, "shareurl") or "").strip()
+    rows = _draft_backup_links(draft)
+    kept = [x for x in rows if x["url"] != main and _same_drive_type(main, x["url"])]
+    _set_draft_backup_links(draft, kept)
+    return len(rows) - len(kept)
+
+
+def _share_links_label(draft: dict[str, Any]) -> str:
+    rows = _draft_backup_links(draft)
+    if not rows:
+        return "无备用链接"
+    ok = len([x for x in rows if x["status"] == "ok"])
+    invalid = len([x for x in rows if x["status"] == "invalid"])
+    return f"{len(rows)} 条 · 可用 {ok} · 失效 {invalid}"
 
 
 def _parse_scalar(text: str, field_type: str) -> Any:
@@ -1117,6 +1210,173 @@ class TelegramBotHandler:
         save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_magic_rule_selector", step="idle", context=ctx, last_message_id=mid)
         db.commit()
 
+    def _show_task_share_links(self, db: Session, chat_id: int, *, notice: str | None = None, message_id: int | None = None) -> None:
+        session = load_session_data(db, chat_id=chat_id, user_id=self.config.user_id)
+        ctx = dict(session.context or {})
+        draft = dict(ctx.get("draft") or {})
+        main = str(_get_nested(draft, "shareurl") or "").strip()
+        backups = _draft_backup_links(draft)
+        lines = ["🔗 分享链接管理"]
+        if notice:
+            lines.append(f"ℹ️ {notice}")
+        lines.append("")
+        main_status = str(_get_nested(draft, "__main_link_status__") or "unknown")
+        lines.append(f"⭐ 主链接 {share_link_status_icon(main_status)} {_short_link_text(main or '-', 72)}")
+        main_reason = str(_get_nested(draft, "__main_link_reason__") or "").strip()
+        if main_reason:
+            lines.append(f"   ⚠️ {_short_link_text(main_reason, 68)}")
+        lines.append("")
+        lines.append(f"🧩 备用链接 {len(backups)}/{MAX_BACKUP_LINKS}")
+        if not backups:
+            lines.append("暂无备用链接")
+        for idx, row in enumerate(backups):
+            lines.append(f"#{idx + 1} {share_link_status_icon(row.get('status'))} {_short_link_text(row.get('url'), 68)}")
+            reason = str(row.get("reason") or "").strip()
+            if reason:
+                lines.append(f"   ⚠️ {_short_link_text(reason, 64)}")
+        lines.append("")
+        lines.append("顺序即转存优先级：靠前的链接先转存，同一集在靠后链接会因去重自动跳过。")
+        lines.append("备用链接必须与主链接同网盘类型；主链接失效时任务会自动改用其余健康链接。")
+        rows: list[list[dict[str, str]]] = []
+        for idx, row in enumerate(backups):
+            rows.append([button(f"#{idx + 1} {share_link_status_icon(row.get('status'))} {_short_link_text(row.get('url'), 26)}", "lnk", "pick", idx)])
+        rows.append([button("➕ 添加备用链接", "lnk", "add"), button("🔍 校验全部", "lnk", "check")])
+        rows.append([button("✏️ 返回编辑器", "lnk", "back"), button("🏠 首页", "home")])
+        mid = self._edit_or_send(chat_id, "\n".join(lines), message_id=message_id or session.last_message_id, reply_markup=keyboard(rows))
+        ctx["draft"] = draft
+        ctx.pop("link_index", None)
+        save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_share_links", step="idle", context=ctx, last_message_id=mid)
+        db.commit()
+
+    def _show_task_share_link_detail(self, db: Session, chat_id: int, *, index: int, message_id: int | None = None) -> None:
+        session = load_session_data(db, chat_id=chat_id, user_id=self.config.user_id)
+        ctx = dict(session.context or {})
+        draft = dict(ctx.get("draft") or {})
+        backups = _draft_backup_links(draft)
+        if index < 0 or index >= len(backups):
+            raise ValueError("备用链接不存在")
+        row = backups[index]
+        lines = [
+            f"🔗 备用链接 #{index + 1} / {len(backups)}",
+            f"状态: {share_link_status_icon(row.get('status'))} {share_link_status_label(row.get('status'))}",
+            f"校验时间: {_display_datetime(row.get('last_checked_at'))}",
+        ]
+        reason = str(row.get("reason") or "").strip()
+        if reason:
+            lines.append(f"失效说明: {_short_link_text(reason, 72)}")
+        lines.append("")
+        lines.append(str(row.get("url") or "-"))
+        rows = [
+            [button("⭐ 设为主链接", "lnk", "promote", index), button("🗑️ 删除", "lnk", "del", index)],
+            [button("⬆️ 上移", "lnk", "up", index), button("⬇️ 下移", "lnk", "down", index)],
+            [button("✏️ 修改链接", "lnk", "edit", index)],
+            [button("⬅️ 返回列表", "lnk", "list"), button("🏠 首页", "home")],
+        ]
+        mid = self._edit_or_send(chat_id, "\n".join(lines), message_id=message_id or session.last_message_id, reply_markup=keyboard(rows))
+        ctx["link_index"] = int(index)
+        save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_share_link_detail", step="idle", context=ctx, last_message_id=mid)
+        db.commit()
+
+    def _show_task_share_link_prompt(self, db: Session, chat_id: int, *, index: int | None, message_id: int | None = None) -> None:
+        session = load_session_data(db, chat_id=chat_id, user_id=self.config.user_id)
+        ctx = dict(session.context or {})
+        draft = dict(ctx.get("draft") or {})
+        if not str(_get_nested(draft, "shareurl") or "").strip():
+            raise ValueError("请先填写主分享链接")
+        backups = _draft_backup_links(draft)
+        if index is None:
+            remaining = MAX_BACKUP_LINKS - len(backups)
+            if remaining <= 0:
+                raise ValueError(f"备用链接最多 {MAX_BACKUP_LINKS} 条")
+            lines = [
+                "请粘贴要添加的备用分享链接。",
+                f"还可添加 {remaining} 条，可一次粘贴多条（换行或空格分隔）。",
+                "备用链接必须与主链接同网盘类型，重复链接会自动跳过。",
+                "添加后会与主链接一致自动定位到实际视频目录。",
+            ]
+            step = "await_backup_link_add"
+        else:
+            if index < 0 or index >= len(backups):
+                raise ValueError("备用链接不存在")
+            lines = [
+                f"请粘贴用于替换备用链接 #{index + 1} 的新链接。",
+                f"当前: {_short_link_text(backups[index].get('url'), 72)}",
+            ]
+            step = "await_backup_link_edit"
+        ctx["link_index"] = -1 if index is None else int(index)
+        save_session_data(
+            db,
+            chat_id=chat_id,
+            user_id=self.config.user_id,
+            scene="task_share_links",
+            step=step,
+            context=ctx,
+            last_message_id=message_id or session.last_message_id,
+        )
+        db.commit()
+        self._show_back_cancel_home(chat_id, "\n".join(lines), message_id=message_id or session.last_message_id)
+
+    def _resolve_backup_link(self, db: Session, draft: dict[str, Any], url: str) -> str:
+        """与主链接一致：自动定位到实际视频目录，定位失败时保留原链接。"""
+        raw = str(url or "").strip()
+        if not raw:
+            return raw
+        probe = {"shareurl": raw, "account_name": _get_nested(draft, "account_name") or ""}
+        try:
+            return self._auto_resolve_task_share_folder(db, probe) or raw
+        except Exception:
+            logger.warning("telegram 备用链接自动定位失败 url=%s", raw, exc_info=True)
+            return raw
+
+    def _check_draft_share_links(self, db: Session, chat_id: int, *, message_id: int | None = None) -> None:
+        session = load_session_data(db, chat_id=chat_id, user_id=self.config.user_id)
+        ctx = dict(session.context or {})
+        draft = dict(ctx.get("draft") or {})
+        main = str(_get_nested(draft, "shareurl") or "").strip()
+        if not main:
+            raise ValueError("请先填写主分享链接")
+        backups = _draft_backup_links(draft)
+        urls = _draft_share_urls(draft)
+        target_id = int(ctx.get("target_id") or 0) or None
+        mid = self._edit_or_send(
+            chat_id,
+            f"⏳ 正在校验 {len(urls)} 条分享链接...",
+            message_id=message_id or session.last_message_id,
+            reply_markup=keyboard([[button("🏠 首页", "home")]]),
+        )
+        actions = self._actions(db)
+        if target_id:
+            # 已保存任务：已落库的链接同时写回校验状态，草稿新增的链接仅拿到结果
+            results = actions.check_task_share_links(target_id, shareurls=urls)
+        else:
+            results = actions.preview_share_links(urls, account_name=str(_get_nested(draft, "account_name") or "").strip() or None)
+        by_url = {str(x.get("url") or "").strip(): x for x in results}
+        checked_at = datetime.now().isoformat()
+        ok_count = 0
+        invalid_count = 0
+        hit = by_url.get(main)
+        if hit is not None:
+            ok = bool(hit.get("ok"))
+            _set_nested(draft, "__main_link_status__", "ok" if ok else "invalid")
+            _set_nested(draft, "__main_link_reason__", None if ok else (hit.get("message") or None))
+            ok_count += 1 if ok else 0
+            invalid_count += 0 if ok else 1
+        for row in backups:
+            hit = by_url.get(str(row.get("url") or "").strip())
+            if hit is None:
+                continue
+            ok = bool(hit.get("ok"))
+            row["status"] = "ok" if ok else "invalid"
+            row["reason"] = None if ok else (hit.get("message") or None)
+            row["last_checked_at"] = checked_at
+            ok_count += 1 if ok else 0
+            invalid_count += 0 if ok else 1
+        _set_draft_backup_links(draft, backups)
+        ctx["draft"] = draft
+        save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_share_links", step="idle", context=ctx, last_message_id=mid)
+        db.commit()
+        self._show_task_share_links(db, chat_id, notice=f"校验完成: 可用 {ok_count} / 失效 {invalid_count}", message_id=mid)
+
     def _task_preview_kwargs(self, draft: dict[str, Any]) -> dict[str, Any]:
         tmdb_id_raw = _get_nested(draft, "tmdb_id")
         tmdb_id = None
@@ -1143,6 +1403,7 @@ class TelegramBotHandler:
         shareurl = str(_get_nested(payload, "shareurl") or "").strip()
         stack = list((ctx or {}).get("share_browse_stack") or [])
         _set_nested(payload, "__share_folder_label__", _share_folder_label(shareurl, stack))
+        _set_nested(payload, "__share_links_label__", _share_links_label(payload))
         _set_nested(payload, "__magic_rule_label__", _magic_rule_binding_label(payload))
         _set_nested(payload, "__tmdb_label__", _tmdb_binding_label(payload))
         startfid = str(_get_nested(payload, "startfid") or "").strip()
@@ -1181,7 +1442,7 @@ class TelegramBotHandler:
                 current_shareurl = _task_shareurl(root_shareurl, str(dirs[0].get("fid") or ""))
                 continue
             if len(dirs) > 1 and not files:
-                picked = sorted(dirs, key=lambda x: _to_sort_ts(x.get("updated_at")), reverse=True)[0]
+                picked = sorted(dirs, key=lambda x: share_sort_timestamp(x.get("updated_at")), reverse=True)[0]
                 current_shareurl = _task_shareurl(root_shareurl, str(picked.get("fid") or ""))
                 continue
             break
@@ -1218,6 +1479,8 @@ class TelegramBotHandler:
         _set_nested(draft, "shareurl", auto_resolved_shareurl)
         _set_nested(draft, "startfid", "")
         _set_nested(draft, "__startfid_label__", "-")
+        _set_nested(draft, "__main_link_status__", "unknown")
+        _set_nested(draft, "__main_link_reason__", None)
         _set_nested(draft, "__share_folder_label__", _share_folder_label(auto_resolved_shareurl))
         return draft, str(info.get("preview_message") or "").strip() or None
 
@@ -1660,7 +1923,7 @@ class TelegramBotHandler:
                 kind="task",
                 title=title,
                 fields=TASK_FIELDS,
-                draft=_flatten_seed(TASK_FIELDS, item),
+                draft=_seed_task_draft(TASK_FIELDS, item),
                 target_id=target_task_id,
                 message_id=loading_mid or session.last_message_id,
                 extras={"page": int(ctx.get("page") or 1), "task_type": str(ctx.get("task_type") or item.get("task_type") or "")},
@@ -1688,7 +1951,7 @@ class TelegramBotHandler:
             kind="task",
             title=title,
             fields=TASK_FIELDS,
-            draft=_flatten_seed(TASK_FIELDS, seed),
+            draft=_seed_task_draft(TASK_FIELDS, seed),
             target_id=None,
             message_id=loading_mid or session.last_message_id,
             extras={"page": int(ctx.get("page") or 1), "task_type": str(ctx.get("task_type") or "")},
@@ -1760,6 +2023,12 @@ class TelegramBotHandler:
                 return
             if session.step == "await_field_input":
                 self._handle_field_input(db, chat_id, user_id, text, session)
+                return
+            if session.step == "await_backup_link_add":
+                self._handle_backup_link_input(db, chat_id, user_id, text, session, replace=False)
+                return
+            if session.step == "await_backup_link_edit":
+                self._handle_backup_link_input(db, chat_id, user_id, text, session, replace=True)
                 return
             if session.step == "await_task_save_subdir":
                 self._handle_task_save_subdir_input(db, chat_id, user_id, text, session)
@@ -1902,6 +2171,9 @@ class TelegramBotHandler:
         if head == "rsel":
             self._dispatch_task_magic_rule_selector(db, chat_id, message_id, parts[1:])
             return
+        if head == "lnk":
+            self._dispatch_task_share_links(db, chat_id, message_id, parts[1:])
+            return
         if head == "shr":
             self._dispatch_share_picker(db, chat_id, message_id, parts[1:])
             return
@@ -1954,7 +2226,7 @@ class TelegramBotHandler:
                 kind="task",
                 title=_editor_title("task", task_id),
                 fields=TASK_FIELDS,
-                draft=_flatten_seed(TASK_FIELDS, item),
+                draft=_seed_task_draft(TASK_FIELDS, item),
                 target_id=task_id,
                 message_id=message_id,
                 extras={"page": int(ctx.get("page") or 1), "task_type": str(ctx.get("task_type") or "")},
@@ -1966,7 +2238,7 @@ class TelegramBotHandler:
                 kind="task",
                 title=_editor_title("task"),
                 fields=TASK_FIELDS,
-                draft=_flatten_seed(TASK_FIELDS),
+                draft=_seed_task_draft(TASK_FIELDS),
                 target_id=None,
                 message_id=message_id,
                 extras={"page": int(ctx.get("page") or 1), "task_type": str(ctx.get("task_type") or "")},
@@ -2006,6 +2278,25 @@ class TelegramBotHandler:
             for item in rows:
                 lines.append(f"#{item.get('id')} {item.get('status')} {item.get('message') or '-'}")
             self._edit_or_send(chat_id, "\n".join(lines), message_id=message_id, reply_markup=keyboard([[button("📌 返回任务详情", "tsk", "detail", task_id)], [button("🏠 首页", "home")]]))
+        elif action == "checklinks":
+            task_id = int(parts[1])
+            self._edit_or_send(
+                chat_id,
+                f"⏳ 正在校验任务 #{task_id} 的全部分享链接...",
+                message_id=message_id,
+                reply_markup=keyboard([[button("🏠 首页", "home")]]),
+            )
+            results = self._actions(db).check_task_share_links(task_id)
+            ok_count = len([x for x in results if bool(x.get("ok"))])
+            self._send(chat_id, f"链接校验完成: 可用 {ok_count} / 失效 {len(results) - ok_count}")
+            self._show_task_detail(
+                db,
+                chat_id,
+                task_id,
+                message_id=message_id,
+                back_page=int(ctx.get("page") or 1),
+                task_type=str(ctx.get("task_type") or "") or None,
+            )
         elif action == "delete":
             task_id = int(parts[1])
             self._edit_or_send(chat_id, f"⚠️ 确认删除任务 #{task_id} 吗？", message_id=message_id, reply_markup=keyboard([[button("🗑️ 确认删除", "confirm", "taskdel", task_id)], [button("✖️ 取消", "tsk", "detail", task_id)]]))
@@ -2269,7 +2560,7 @@ class TelegramBotHandler:
                 seed["tmdb_media_type"] = str(selected_tmdb.get("media_type") or "")
                 seed["__tmdb_title__"] = str(selected_tmdb.get("display_title") or selected_tmdb.get("title") or selected_tmdb.get("name") or "")
                 seed["taskname"] = str(selected_tmdb.get("display_title") or selected_tmdb.get("title") or selected_tmdb.get("name") or seed["taskname"])
-            draft = _flatten_seed(TASK_FIELDS, seed)
+            draft = _seed_task_draft(TASK_FIELDS, seed)
             self._start_editor(db, chat_id, kind="task", title="基于搜索结果新建任务", fields=TASK_FIELDS, draft=draft, message_id=message_id)
         elif action == "replace":
             idx = int(parts[1])
@@ -2288,6 +2579,30 @@ class TelegramBotHandler:
                 db,
                 chat_id,
                 int(task["id"]),
+                message_id=message_id,
+                back_page=int(ctx.get("page") or 1),
+                task_type=str(ctx.get("task_type") or "") or None,
+            )
+        elif action == "append":
+            idx = int(parts[1])
+            if idx >= len(results):
+                raise ValueError("搜索结果不存在")
+            if not replace_task_id:
+                raise ValueError("没有指定要追加备用链接的任务")
+            item = results[idx]
+            outcome = self._actions(db).append_task_share_links(replace_task_id, [str(item.get("shareurl") or "")])
+            notes = [f"已追加 {int(outcome.get('added') or 0)} 条备用链接"]
+            if int(outcome.get("skipped_duplicate") or 0):
+                notes.append("链接已存在")
+            if int(outcome.get("skipped_drive_type") or 0):
+                notes.append("与主链接网盘类型不一致")
+            if int(outcome.get("skipped_limit") or 0):
+                notes.append(f"已达链接上限 {MAX_BACKUP_LINKS + 1} 条")
+            self._send(chat_id, "；".join(notes))
+            self._show_task_detail(
+                db,
+                chat_id,
+                int((outcome.get("task") or {}).get("id") or replace_task_id),
                 message_id=message_id,
                 back_page=int(ctx.get("page") or 1),
                 task_type=str(ctx.get("task_type") or "") or None,
@@ -2735,6 +3050,15 @@ class TelegramBotHandler:
             db.commit()
             self._show_task_drive_browser(db, chat_id, message_id=message_id)
             return
+        if step in {"await_backup_link_add", "await_backup_link_edit"}:
+            index = int(ctx.get("link_index") if ctx.get("link_index") is not None else -1)
+            save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_share_links", step="idle", context=ctx, last_message_id=message_id)
+            db.commit()
+            if step == "await_backup_link_edit" and index >= 0:
+                self._show_task_share_link_detail(db, chat_id, index=index, message_id=message_id)
+            else:
+                self._show_task_share_links(db, chat_id, message_id=message_id)
+            return
         if step == "await_keyword" and scene == "search":
             replace_task_id = int(ctx.get("replace_task_id") or 0) or None
             if replace_task_id:
@@ -2829,6 +3153,169 @@ class TelegramBotHandler:
             extras={k: v for k, v in ctx.items() if k != "draft"},
         )
 
+    def _dispatch_task_share_links(self, db: Session, chat_id: int, message_id: int, parts: list[str]) -> None:
+        session = load_session_data(db, chat_id=chat_id, user_id=self.config.user_id)
+        ctx = dict(session.context or {})
+        draft = dict(ctx.get("draft") or {})
+        action = parts[0] if parts else "list"
+        if action == "list":
+            self._show_task_share_links(db, chat_id, message_id=message_id)
+            return
+        if action == "back":
+            ctx.pop("link_index", None)
+            save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_editor", step="idle", context=ctx, last_message_id=message_id)
+            db.commit()
+            self._resume_task_editor(db, chat_id, ctx=ctx, message_id=message_id)
+            return
+        if action == "add":
+            self._show_task_share_link_prompt(db, chat_id, index=None, message_id=message_id)
+            return
+        if action == "check":
+            self._check_draft_share_links(db, chat_id, message_id=message_id)
+            return
+        index = int(parts[1]) if len(parts) > 1 and str(parts[1]).lstrip("-").isdigit() else -1
+        backups = _draft_backup_links(draft)
+        if index < 0 or index >= len(backups):
+            raise ValueError("备用链接不存在")
+        if action == "pick":
+            self._show_task_share_link_detail(db, chat_id, index=index, message_id=message_id)
+            return
+        if action == "edit":
+            self._show_task_share_link_prompt(db, chat_id, index=index, message_id=message_id)
+            return
+        if action in {"up", "down"}:
+            target = index - 1 if action == "up" else index + 1
+            if target < 0 or target >= len(backups):
+                raise ValueError("已到达边界，无法继续移动")
+            backups[index], backups[target] = backups[target], backups[index]
+            _set_draft_backup_links(draft, backups)
+            ctx["draft"] = draft
+            save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, context=ctx)
+            db.commit()
+            self._show_task_share_link_detail(db, chat_id, index=target, message_id=message_id)
+            return
+        if action == "del":
+            removed = backups.pop(index)
+            _set_draft_backup_links(draft, backups)
+            ctx["draft"] = draft
+            save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_share_links", step="idle", context=ctx, last_message_id=message_id)
+            db.commit()
+            self._show_task_share_links(db, chat_id, notice=f"已删除: {_short_link_text(removed.get('url'), 44)}", message_id=message_id)
+            return
+        if action == "promote":
+            self._promote_draft_share_link(db, chat_id, ctx=ctx, draft=draft, index=index, message_id=message_id)
+            return
+        self._show_task_share_links(db, chat_id, message_id=message_id)
+
+    def _promote_draft_share_link(
+        self,
+        db: Session,
+        chat_id: int,
+        *,
+        ctx: dict[str, Any],
+        draft: dict[str, Any],
+        index: int,
+        message_id: int | None = None,
+    ) -> None:
+        """备用链接升为主链接：已落库的链接直接调服务层立即生效，未保存的仅调整草稿。"""
+        backups = _draft_backup_links(draft)
+        row = backups.pop(index)
+        url = str(row.get("url") or "").strip()
+        old_main = str(_get_nested(draft, "shareurl") or "").strip()
+        old_status = str(_get_nested(draft, "__main_link_status__") or "unknown")
+        old_reason = _get_nested(draft, "__main_link_reason__")
+        target_id = int(ctx.get("target_id") or 0) or None
+        activated = False
+        if target_id:
+            persisted = {
+                str(x.get("url") or "").strip()
+                for x in (self._actions(db).get_task_detail(target_id).get("shareurls") or [])
+            }
+            if url in persisted:
+                self._actions(db).promote_task_share_link(target_id, url)
+                activated = True
+        _set_nested(draft, "shareurl", url)
+        _set_nested(draft, "__main_link_status__", "ok" if activated else str(row.get("status") or "unknown"))
+        _set_nested(draft, "__main_link_reason__", None if activated else (row.get("reason") or None))
+        # startfid 是旧主链接内的文件 fid，换主链接后已失效
+        _set_nested(draft, "startfid", "")
+        _set_nested(draft, "__startfid_label__", "-")
+        if old_main:
+            backups.insert(0, _new_backup_link(old_main, status=old_status, reason=old_reason))
+        _set_draft_backup_links(draft, backups)
+        _prune_draft_backup_links(draft)
+        # 主链接已变，分享目录浏览上下文必须丢弃，否则会沿用旧链接的 fid 堆栈
+        for key in ("share_root_shareurl", "share_browse_shareurl", "share_browse_stack", "share_dir_items", "share_startfid_items", "share_picker_mode"):
+            ctx.pop(key, None)
+        ctx["draft"] = draft
+        save_session_data(db, chat_id=chat_id, user_id=self.config.user_id, scene="task_share_links", step="idle", context=ctx, last_message_id=message_id)
+        db.commit()
+        notice = "已切换为主链接（已生效）" if activated else "已设为主链接，保存后生效"
+        self._show_task_share_links(db, chat_id, notice=notice, message_id=message_id)
+
+    def _handle_backup_link_input(self, db: Session, chat_id: int, user_id: int, text: str, session, *, replace: bool) -> None:
+        ctx = dict(session.context or {})
+        draft = dict(ctx.get("draft") or {})
+        main = str(_get_nested(draft, "shareurl") or "").strip()
+        if not main:
+            self._send(chat_id, "请先填写主分享链接")
+            return
+        candidates = [str((x or {}).get("shareurl") or "").strip() for x in self._actions(db).extract_share_candidates(text)]
+        candidates = list(dict.fromkeys(x for x in candidates if x))
+        if not candidates:
+            self._send(chat_id, "未识别到网盘分享链接，请重新粘贴")
+            return
+        backups = _draft_backup_links(draft)
+        index = int(ctx.get("link_index") if ctx.get("link_index") is not None else -1)
+        notes: list[str] = []
+        if replace:
+            if index < 0 or index >= len(backups):
+                self._send(chat_id, "备用链接不存在")
+                return
+            url = self._resolve_backup_link(db, draft, candidates[0])
+            if not _same_drive_type(main, url):
+                self._send(chat_id, "备用链接必须与主链接同网盘类型")
+                return
+            if url == main or any(x["url"] == url for i, x in enumerate(backups) if i != index):
+                self._send(chat_id, "该链接已存在")
+                return
+            backups[index] = _new_backup_link(url)
+            notes.append(f"已替换备用链接 #{index + 1}")
+        else:
+            used = {main} | {x["url"] for x in backups}
+            added = 0
+            skipped_duplicate = 0
+            skipped_drive_type = 0
+            skipped_limit = 0
+            for raw in candidates:
+                if len(backups) >= MAX_BACKUP_LINKS:
+                    skipped_limit += 1
+                    continue
+                if not _same_drive_type(main, raw):
+                    skipped_drive_type += 1
+                    continue
+                url = self._resolve_backup_link(db, draft, raw)
+                if url in used:
+                    skipped_duplicate += 1
+                    continue
+                used.add(url)
+                backups.append(_new_backup_link(url))
+                added += 1
+            if added:
+                notes.append(f"已添加 {added} 条备用链接")
+            if skipped_duplicate:
+                notes.append(f"跳过重复 {skipped_duplicate} 条")
+            if skipped_drive_type:
+                notes.append(f"跳过异网盘类型 {skipped_drive_type} 条")
+            if skipped_limit:
+                notes.append(f"超出上限跳过 {skipped_limit} 条")
+        _set_draft_backup_links(draft, backups)
+        ctx["draft"] = draft
+        ctx.pop("link_index", None)
+        save_session_data(db, chat_id=chat_id, user_id=user_id, scene="task_share_links", step="idle", context=ctx)
+        db.commit()
+        self._show_task_share_links(db, chat_id, notice="；".join(notes) or None, message_id=session.last_message_id)
+
     def _dispatch_sync_account_selector(self, db: Session, chat_id: int, message_id: int, parts: list[str]) -> None:
         session = load_session_data(db, chat_id=chat_id, user_id=self.config.user_id)
         ctx = dict(session.context or {})
@@ -2919,6 +3406,11 @@ class TelegramBotHandler:
             return
         if kind == "task" and field == "__share_folder__":
             self._show_task_share_browser(db, chat_id, picker="folder", message_id=message_id)
+            return
+        if kind == "task" and field == "__share_links__":
+            if not str(_get_nested(draft, "shareurl") or "").strip():
+                raise ValueError("请先填写主分享链接")
+            self._show_task_share_links(db, chat_id, message_id=message_id)
             return
         if kind == "task" and field == "__magic_rule__":
             self._show_task_magic_rule_selector(db, chat_id, message_id=message_id)
@@ -3020,6 +3512,11 @@ class TelegramBotHandler:
         if kind == "task":
             _set_nested(draft, "task_type", "drama")
         payload = _collapse_payload(fields, draft)
+        if kind == "task":
+            # 草稿是链接列表的唯一来源：必须总是下发 shareurls，否则删除备用链接不会生效
+            share_urls = _draft_share_urls(draft)
+            if share_urls:
+                payload["shareurls"] = share_urls
         actions = self._actions(db)
         if kind == "task":
             item = actions.save_task(task_id=target_id, payload=payload)
@@ -3078,6 +3575,10 @@ class TelegramBotHandler:
         _set_nested(draft, field, value)
         if kind == "task" and field == "shareurl":
             draft, _message = self._apply_task_share_autofill(db, draft)
+            # 主链接换盘后残留的异盘备用链接会让保存直接失败，这里直接丢弃
+            dropped = _prune_draft_backup_links(draft)
+            if dropped:
+                self._send(chat_id, f"主链接已变更，已移除 {dropped} 条不同网盘类型或重复的备用链接")
             for key in ("share_root_shareurl", "share_browse_shareurl", "share_browse_stack", "share_dir_items", "share_startfid_items", "share_picker_mode"):
                 ctx.pop(key, None)
         if kind == "task" and field in {"pattern", "replace"}:

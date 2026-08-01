@@ -78,6 +78,14 @@ from app.services.sync_tasks import (
 from app.extensions.runtime.sync_executor import SyncExecutor
 from app.services import audit
 from app.services.task_scheduler import get_or_create_task_scheduler_setting, update_task_scheduler_setting
+from app.services.task_share_links import (
+    MAX_SHARE_LINKS,
+    load_share_links,
+)
+from app.services.task_share_links import check_task_share_links as _svc_check_share_links
+from app.services.task_share_links import promote_link as _svc_promote_link
+from app.services.task_share_links import replace_active_link as _svc_replace_active_link
+from app.services.task_share_links import set_share_links_from_urls as _svc_set_share_links
 from app.services.tasks import (
     create_task,
     delete_task,
@@ -88,6 +96,10 @@ from app.services.tasks import (
 )
 from app.extensions.runtime.task_executor import TaskExecutor
 from app.services.tmdb_settings import get_or_create_tmdb_setting, get_tmdb_runtime_config, load_tmdb_config, update_tmdb_setting
+
+
+# 备用链接上限：主链接 + 备用链接合计不超过 MAX_SHARE_LINKS
+MAX_BACKUP_LINKS = MAX_SHARE_LINKS - 1
 
 
 def _loads(value: str | None) -> dict[str, Any]:
@@ -330,7 +342,7 @@ def _is_video_filename(name: str) -> bool:
     return bool(re.search(r"\.(mp4|mkv|mov|m4v|avi|mpeg|ts|flv|wmv|webm|cas)$", str(name or "").strip(), flags=re.IGNORECASE))
 
 
-def _to_sort_ts(value: Any) -> float:
+def share_sort_timestamp(value: Any) -> float:
     try:
         number = float(value)
         return number if number > 1e12 else number * 1000
@@ -443,6 +455,12 @@ def _sync_endpoint_dict(db: Session, *, endpoint_type: str, path: str, account_i
     return payload
 
 
+def _share_links_payload(task: Task) -> list[dict[str, Any]]:
+    """任务的多分享链接明细：首位为活跃链接，顺序即转存优先级。"""
+    active = str(getattr(task, "shareurl", "") or "").strip()
+    return [{**link, "is_active": link["url"] == active} for link in load_share_links(task)]
+
+
 def _task_to_dict(db: Session, task: Task) -> dict[str, Any]:
     sync_task_uids = db.execute(select(SyncTaskDramaLink.sync_task_uid).where(SyncTaskDramaLink.task_uid == str(task.task_uid))).scalars().all()
     sync_uid_list = [str(x) for x in sync_task_uids if x]
@@ -459,6 +477,7 @@ def _task_to_dict(db: Session, task: Task) -> dict[str, Any]:
         "task_type": str(task.task_type or ""),
         "taskname": str(task.taskname or ""),
         "shareurl": str(task.shareurl or ""),
+        "shareurls": _share_links_payload(task),
         "savepath": str(task.savepath or ""),
         "pattern": task.pattern,
         "replace": task.replace,
@@ -812,7 +831,7 @@ class TelegramBotActions:
             if not isinstance(item, dict):
                 continue
             item["updated_at_display"] = _format_display_datetime(item.get("updated_at"))
-        items.sort(key=lambda x: (not bool(x.get("is_dir")), -_to_sort_ts(x.get("updated_at")), str(x.get("name") or "").lower()))
+        items.sort(key=lambda x: (not bool(x.get("is_dir")), -share_sort_timestamp(x.get("updated_at")), str(x.get("name") or "").lower()))
         data["items"] = items
         return data
 
@@ -861,17 +880,117 @@ class TelegramBotActions:
         tmdb_id: int | None = None,
         tmdb_media_type: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"shareurl": shareurl}
+        """换主链接：新链接接管主位，旧主链接降为备用（同盘时），并清空封禁与 startfid。"""
+        new_url = str(shareurl or "").strip()
+        if not new_url:
+            raise ValueError("分享链接不能为空")
+        payload: dict[str, Any] = {}
         if account_name is not None:
             payload["account_name"] = account_name
         if tmdb_id:
             payload["tmdb_id"] = int(tmdb_id)
         if tmdb_media_type:
             payload["tmdb_media_type"] = str(tmdb_media_type)
-        task = update_task(self.db, int(task_id), **payload)
+        task = get_task(self.db, int(task_id))
+        if str(getattr(task, "task_type", "") or "") == "drama":
+            # 走多链接服务层：保留同盘备用链接，避免换链丢掉已配置的其余链接
+            _svc_replace_active_link(self.db, task, new_url, source="manual")
+        else:
+            payload["shareurl"] = new_url
+        if payload:
+            task = update_task(self.db, int(task_id), **payload)
         self.db.commit()
         self.db.refresh(task)
         return _task_to_dict(self.db, task)
+
+    def append_task_share_links(self, task_id: int, shareurls: list[str]) -> dict[str, Any]:
+        """把链接追加为备用链接：去重 / 同盘 / 上限不合规的项直接跳过并回报统计。"""
+        task = get_task(self.db, int(task_id))
+        if str(getattr(task, "task_type", "") or "") != "drama":
+            raise ValueError("仅追剧任务支持多个分享链接")
+        existing = [x["url"] for x in load_share_links(task)]
+        active = str(getattr(task, "shareurl", "") or "").strip()
+        active_drive_type = AdapterRegistry.detect_drive_type(active) if active else None
+        used = set(existing)
+        added: list[str] = []
+        skipped_duplicate = 0
+        skipped_drive_type = 0
+        skipped_limit = 0
+        for raw in shareurls or []:
+            url = str(raw or "").strip()
+            if not url:
+                continue
+            if url in used:
+                skipped_duplicate += 1
+                continue
+            if active_drive_type is not None and AdapterRegistry.detect_drive_type(url) != active_drive_type:
+                skipped_drive_type += 1
+                continue
+            if len(existing) + len(added) >= MAX_SHARE_LINKS:
+                skipped_limit += 1
+                continue
+            used.add(url)
+            added.append(url)
+        if added:
+            _svc_set_share_links(self.db, task, existing + added)
+            self.db.commit()
+            self.db.refresh(task)
+        return {
+            "added": len(added),
+            "skipped_duplicate": skipped_duplicate,
+            "skipped_drive_type": skipped_drive_type,
+            "skipped_limit": skipped_limit,
+            "task": _task_to_dict(self.db, task),
+        }
+
+    def check_task_share_links(self, task_id: int, *, shareurls: list[str] | None = None) -> list[dict[str, Any]]:
+        """校验已保存任务的链接：结果写回链接列表，传入的草稿新链接仅返回结果。"""
+        task = get_task(self.db, int(task_id))
+        results = _svc_check_share_links(self.db, task, shareurls=shareurls)
+        self.db.commit()
+        return results
+
+    def preview_share_links(self, shareurls: list[str], *, account_name: str | None = None) -> list[dict[str, Any]]:
+        """校验尚未保存的链接列表：仅预检不落库，供新建任务草稿使用。"""
+        urls = [str(x or "").strip() for x in (shareurls or [])]
+        urls = list(dict.fromkeys(x for x in urls if x))
+        if not urls:
+            return []
+        out, changed = preview_share_batch(self.db, SharePreviewBatchIn(shareurls=urls, account_name=account_name or None))
+        if changed:
+            self.db.commit()
+        by_url = {str(getattr(x, "shareurl", "") or "").strip(): x for x in (out.items or [])}
+        results: list[dict[str, Any]] = []
+        for url in urls:
+            row = by_url.get(url)
+            ok = bool(getattr(row, "ok", False)) if row is not None else False
+            message = (str(getattr(row, "message", "") or "").strip() or None) if row is not None else "验证无结果"
+            results.append({"url": url, "ok": ok, "message": None if ok else message, "status": "ok" if ok else "invalid"})
+        return results
+
+    def promote_task_share_link(self, task_id: int, shareurl: str) -> dict[str, Any]:
+        """把已保存任务的某条链接切为主链接（同时清空封禁与已失效的 startfid）。"""
+        task = get_task(self.db, int(task_id))
+        url = str(shareurl or "").strip()
+        if not _svc_promote_link(self.db, int(task.id), url):
+            raise ValueError("该链接不在任务的链接列表中")
+        audit.audit_log(
+            self.db,
+            actor=audit.SystemActor("Telegram 机器人"),
+            action="task.shareurl_switch",
+            summary=audit.action_label("task.shareurl_switch"),
+            target_type="task",
+            target_id=task.id,
+            target_name=str(task.taskname or ""),
+            source=audit.SOURCE_MANUAL,
+            detail=f"Telegram 机器人切换主链接：{url}",
+        )
+        self.db.commit()
+        self.db.refresh(task)
+        return _task_to_dict(self.db, task)
+
+    def detect_drive_type(self, shareurl: str) -> str | None:
+        return AdapterRegistry.detect_drive_type(str(shareurl or "").strip())
 
     def list_sync_tasks(self, *, page: int = 1, page_size: int = 8) -> dict[str, Any]:
         page = max(1, int(page or 1))

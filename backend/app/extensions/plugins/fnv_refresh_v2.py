@@ -130,6 +130,8 @@ class Fnv_refresh_v2:
         return bool(self.fnv_token)
 
     def _extract_signing_keys(self) -> None:
+        # 保存预配置值作为兜底：不同部署的 secret/api_key 不同，
+        # 必须优先从当前部署的前端 JS 中提取，预配值仅在提取失败时使用
         pre_secret = self.secret
         pre_api_key = self.api_key
         if pre_secret and pre_api_key:
@@ -149,6 +151,7 @@ class Fnv_refresh_v2:
             return
         logger.debug("%s: 发现入口 JS %s 个: %s", self.plugin_name, len(js_files), js_files)
 
+        # 记录每个文件的提取尝试结果，用于诊断
         extraction_log: list[dict[str, Any]] = []
 
         for js_url in js_files:
@@ -158,16 +161,16 @@ class Fnv_refresh_v2:
                 logger.debug("%s: 读取入口 JS 失败 %s %s", self.plugin_name, js_url, exc)
                 continue
             file_log: dict[str, Any] = {"url": js_url, "size": len(js_text)}
-            if not self.secret:
-                self.secret = self._extract_secret(js_text) or self.secret
-                file_log["secret"] = bool(self.secret)
-                if self.secret:
-                    logger.info("%s: 从 %s 提取到 secret=%s", self.plugin_name, js_url, self._mask(self.secret))
-            if not self.api_key:
-                self.api_key = self._extract_api_key(js_text) or self.api_key
-                file_log["api_key"] = bool(self.api_key)
-                if self.api_key:
-                    logger.info("%s: 从 %s 提取到 api_key=%s", self.plugin_name, js_url, self._mask(self.api_key))
+            extracted_secret = self._extract_secret(js_text)
+            if extracted_secret:
+                self.secret = extracted_secret
+                file_log["secret"] = True
+                logger.info("%s: 从 %s 提取到 secret=%s", self.plugin_name, js_url, self._mask(self.secret))
+            extracted_api_key = self._extract_api_key(js_text)
+            if extracted_api_key:
+                self.api_key = extracted_api_key
+                file_log["api_key"] = True
+                logger.info("%s: 从 %s 提取到 api_key=%s", self.plugin_name, js_url, self._mask(self.api_key))
             if self.secret and self.api_key:
                 return
             extraction_log.append(file_log)
@@ -186,16 +189,16 @@ class Fnv_refresh_v2:
                     logger.debug("%s: 读取 chunk 失败 %s %s", self.plugin_name, chunk_url, exc)
                     continue
                 chunk_log: dict[str, Any] = {"url": chunk_url, "size": len(chunk_text)}
-                if not self.secret:
-                    self.secret = self._extract_secret(chunk_text) or self.secret
-                    chunk_log["secret"] = bool(self.secret)
-                    if self.secret:
-                        logger.info("%s: 从 chunk %s 提取到 secret=%s", self.plugin_name, chunk_url, self._mask(self.secret))
-                if not self.api_key:
-                    self.api_key = self._extract_api_key(chunk_text) or self.api_key
-                    chunk_log["api_key"] = bool(self.api_key)
-                    if self.api_key:
-                        logger.info("%s: 从 chunk %s 提取到 api_key=%s", self.plugin_name, chunk_url, self._mask(self.api_key))
+                extracted_secret = self._extract_secret(chunk_text)
+                if extracted_secret:
+                    self.secret = extracted_secret
+                    chunk_log["secret"] = True
+                    logger.info("%s: 从 chunk %s 提取到 secret=%s", self.plugin_name, chunk_url, self._mask(self.secret))
+                extracted_api_key = self._extract_api_key(chunk_text)
+                if extracted_api_key:
+                    self.api_key = extracted_api_key
+                    chunk_log["api_key"] = True
+                    logger.info("%s: 从 chunk %s 提取到 api_key=%s", self.plugin_name, chunk_url, self._mask(self.api_key))
                 if self.secret and self.api_key:
                     return
                 extraction_log.append(chunk_log)
@@ -618,7 +621,11 @@ class Fnv_refresh_v2:
 
     @staticmethod
     def _extract_api_key(js_text: str) -> str | None:
+        # ── 策略 1（最灵活）：Uint8Array 字节 + XOR + TextDecoder ──
+        # API key 以 XOR 编码存储在 Uint8Array 中，解码公式：byte ^ xorKey
+        # 变量名由 minifier 决定，不能硬编码
         strategies: list[tuple[str, re.Pattern]] = [
+            # 策略 1: 通用模式 — Uint8Array([...])...任意变量 XOR 赋值...TextDecoder decode
             (
                 "Uint8Array+XOR+TextDecoder",
                 re.compile(
@@ -630,6 +637,7 @@ class Fnv_refresh_v2:
                     re.DOTALL,
                 ),
             ),
+            # 策略 2: XOR 紧跟在 Uint8Array 后面，变量名任意
             (
                 "Uint8Array+XOR-simple",
                 re.compile(
@@ -639,6 +647,7 @@ class Fnv_refresh_v2:
                     re.DOTALL,
                 ),
             ),
+            # 策略 3: 原始模式（兼容旧版 minifier）
             (
                 "legacy-t[n]=e[n]^",
                 re.compile(
@@ -655,13 +664,35 @@ class Fnv_refresh_v2:
             try:
                 byte_str = groups[0]
                 byte_values = [int(item.strip()) for item in byte_str.split(",") if item.strip()]
+                # XOR key 是最后一个捕获组（数字）
                 xor_key = int(groups[-1])
                 decoded = bytes(value ^ xor_key for value in byte_values).decode("utf-8")
+                # 基本合法性校验：API key 应该是可打印 ASCII
                 if decoded and all(32 <= ord(c) < 127 for c in decoded):
                     logger.debug("_extract_api_key: 策略 %s 命中, xorKey=%d, len=%d", name, xor_key, len(decoded))
                     return decoded
             except Exception:
                 continue
+
+        for ref_match in re.finditer(r'\bapiKey\s*:\s*([a-zA-Z_$][\w$]*)', js_text):
+            var_name = ref_match.group(1)
+            scan_start = max(0, ref_match.start() - 3000)
+            scan_region = js_text[scan_start:ref_match.start()]
+            assign_pat = re.compile(
+                rf'(?:^|[;{{,])\s*{re.escape(var_name)}\s*=\s*(["\'])'
+                rf'([0-9A-Fa-f]{{8}}-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{4}}'
+                rf'-[0-9A-Fa-f]{{4}}-[0-9A-Fa-f]{{12}})\1'
+            )
+            assign_match = assign_pat.search(scan_region)
+            if assign_match:
+                api_key_value = assign_match.group(2).upper()
+                logger.debug(
+                    "_extract_api_key: 策略 plain-uuid 命中, var=%s, len=%d",
+                    var_name,
+                    len(api_key_value),
+                )
+                return api_key_value
+
         return None
 
     @staticmethod
