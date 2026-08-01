@@ -37,11 +37,10 @@ class Fnv_refresh_v2:
     )
 
     default_config = {
-        "tips": "填写 endpoint、mount_quark 后即可启用；secret/api_key 可手动指定（自动提取失败时兜底）；token/long_token/fnv_token 可选。",
-        "endpoint": "",
-        "username": "",
-        "password": "",
-        "mount_quark": "",
+        "endpoint": "", # 飞牛影视接口地址，示例：http://192.168.1.100:5666。无需/v后缀
+        "username": "", # 飞牛影视账号，非飞牛账号
+        "password": "", # 飞牛影视密码，非飞牛密码
+        "mount_dir": "", # 媒体库路径
         "remove_useless_wait": 180,
         "token": "",
         "long_token": "",
@@ -68,19 +67,19 @@ class Fnv_refresh_v2:
             setattr(self, key, kwargs.get(key, value))
 
         self.endpoint = self._normalize_endpoint(self.endpoint)
-        self.mount_quark = self._normalize_path(self.mount_quark)
+        self.mount_dir = self._normalize_path(self.mount_dir)
         self.remove_useless_wait = self._as_int(self.remove_useless_wait, default=180)
 
-        if not self.endpoint or not self.mount_quark:
-            logger.warning("%s: 缺少 endpoint 或 mount_quark，插件未激活", self.plugin_name)
+        if not self.endpoint or not self.mount_dir:
+            logger.warning("%s: 缺少 endpoint 或 mount_dir，插件未激活", self.plugin_name)
             return
 
         self.is_active = self._bootstrap_runtime_auth(force=False)
         logger.info(
-            "%s: 配置状态 endpoint=%s mount_quark=%s secret=%s api_key=%s fnv_token=%s token=%s long_token=%s",
+            "%s: 配置状态 endpoint=%s mount_dir=%s secret=%s api_key=%s fnv_token=%s token=%s long_token=%s",
             self.plugin_name,
             self.endpoint,
-            self.mount_quark,
+            self.mount_dir,
             self._mask(self.secret),
             self._mask(self.api_key),
             self._mask(self.fnv_token),
@@ -103,15 +102,18 @@ class Fnv_refresh_v2:
         if not target_path:
             return task
 
-        library_id = self._get_library_id(target_path)
-        if not library_id:
+        library_ids = self._get_matching_library_ids(target_path)
+        if not library_ids:
             logger.warning("%s: 未找到与路径匹配的媒体库 %s", self.plugin_name, target_path)
             return task
 
-        if self._scan_library(library_id, target_path):
-            logger.info("%s: 已触发飞牛影视刷新 %s", self.plugin_name, target_path)
-            if self.remove_useless_wait >= 0:
-                self._remove_useless()
+        scanned = False
+        for library_id in library_ids:
+            if self._scan_library(library_id, target_path):
+                logger.info("%s: 已触发飞牛影视刷新 library=%s path=%s", self.plugin_name, library_id, target_path)
+                scanned = True
+        if scanned and self.remove_useless_wait >= 0:
+            self._remove_useless()
         return task
 
     def _bootstrap_runtime_auth(self, *, force: bool) -> bool:
@@ -410,7 +412,7 @@ class Fnv_refresh_v2:
             cookies.append(f"Trim-MC-token={self.fnv_token}")
         return {"Cookie": "; ".join(cookies)} if cookies else {}
 
-    def _get_library_id(self, target_path: str) -> str | None:
+    def _get_matching_library_ids(self, target_path: str) -> list[str]:
         payload = self._request("GET", f"{self.API_PREFIX}/mdb/list")
         libraries = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(libraries, list) or not libraries:
@@ -420,22 +422,18 @@ class Fnv_refresh_v2:
                 payload.get("code") if isinstance(payload, dict) else None,
                 self._payload_message(payload),
             )
-            return None
+            return []
 
-        if len(libraries) == 1:
-            return self._extract_guid(libraries[0])
-
-        best_guid = None
-        best_score = -1
+        matched: list[str] = []
         for item in libraries:
             guid = self._extract_guid(item)
             if not guid:
                 continue
             for path_value in self._extract_path_candidates(item):
-                if self._path_matches_library(target_path, path_value) and len(path_value) > best_score:
-                    best_guid = guid
-                    best_score = len(path_value)
-        return best_guid
+                if self._path_matches_library(target_path, path_value):
+                    matched.append(guid)
+                    break
+        return matched
 
     def _scan_library(self, library_id: str, target_path: str) -> bool:
         payload = self._request(
@@ -464,10 +462,10 @@ class Fnv_refresh_v2:
                 return
 
     def _build_target_path(self, _savepath: str) -> str:
-        mount_quark = self._normalize_path(self.mount_quark)
-        if not mount_quark:
+        mount_dir = self._normalize_path(self.mount_dir)
+        if not mount_dir:
             return ""
-        return mount_quark
+        return mount_dir
 
     def _extract_guid(self, item: Any) -> str | None:
         candidates = self._find_all(item, {"guid", "id", "mdb_guid"})
@@ -508,7 +506,9 @@ class Fnv_refresh_v2:
             return False
         if target == library:
             return True
-        return target.startswith(library.rstrip("/") + "/")
+        target_prefix = target.rstrip("/") + "/"
+        library_prefix = library.rstrip("/") + "/"
+        return library.startswith(target_prefix) or target.startswith(library_prefix)
 
     def _needs_signature(self, path: str, method: str) -> bool:
         if "/play/record" in path and method.upper() == "DELETE":

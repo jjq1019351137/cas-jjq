@@ -22,6 +22,8 @@ from app.extensions.runtime.retry_utils import RetryResult, retry_call, summariz
 
 logger = logging.getLogger(__name__)
 
+_FILE_DETAIL_LOG_LIMIT = 500
+
 
 _VIDEO_EXTS = {
     ".3g2",
@@ -260,6 +262,18 @@ class DramaTaskExecutor:
     def _line(self, text: str = "") -> None:
         if self.log:
             self.log.line(text)
+
+    def _line_file_details(self, entries: list[tuple[str, str]]) -> None:
+        for idx, (origin, target) in enumerate(entries[:_FILE_DETAIL_LOG_LIMIT], start=1):
+            origin_name = str(origin or "").strip()
+            target_name = str(target or "").strip()
+            if origin_name and target_name and origin_name != target_name:
+                self._line(f"  {idx}. {origin_name} → {target_name}")
+            else:
+                self._line(f"  {idx}. {target_name or origin_name}")
+        overflow = len(entries) - _FILE_DETAIL_LOG_LIMIT
+        if overflow > 0:
+            self._line(f"  ...（还有 {overflow} 个文件未列出）")
 
     def _normalize_relative_dir(self, relative_path: str | None) -> str:
         text = str(relative_path or "").strip().strip("/")
@@ -771,6 +785,7 @@ class DramaTaskExecutor:
                     context=f"{share_dir_name}/{name}",
                 ):
                     continue
+                self._line(f"转存目录: {share_dir_name}/{name}")
                 tree.create_node(f"📁{name}", f"dir-new-{dest_dir_name}-{fid}", parent=parent_node)
                 continue
             # 子目录内文件仍按 pattern 过滤（仅过滤，不重命名）
@@ -791,6 +806,7 @@ class DramaTaskExecutor:
                 context=f"{share_dir_name}/{name}",
             ):
                 continue
+            self._line(f"转存: {share_dir_name}/{name}")
             tree.create_node(f"{name} -> {name}", f"file-{dest_dir_name}-{fid}", parent=parent_node)
 
     def _compile_subdir_file_pattern(self) -> re.Pattern[str] | None:
@@ -1172,6 +1188,7 @@ class DramaTaskExecutor:
         plan = self._plan_transfer(share_files=self._iter_files(root_files), dest_file_list=dest_file_list)
         self._line(f"待转存文件数: {len(plan)}")
         if plan:
+            self._line_file_details([(item.origin_name, item.target_name) for item in plan])
             self._mark_changed_dir("")
             self._set_stage("save_file")
             self._section("执行转存")
@@ -1237,6 +1254,7 @@ class DramaTaskExecutor:
                     self._line(f"提示: 创建目录失败，回退整目录转存 {name}")
                     if not self._save_items_tolerant(pwd_id=str(pwd_id), stoken=str(stoken), to_pdir_fid=dest_root_fid, items=[raw], context=name):
                         continue
+                    self._line(f"转存目录: {name}（重存）")
                     tree.create_node(f"📁{name}（重存）", f"dir-resave-{fid}", parent="root")
                     continue
                 existing_dest_fid = dest_dir_map.get(name)
@@ -1285,6 +1303,7 @@ class DramaTaskExecutor:
                 self._line(f"提示: 创建目录失败，回退整目录转存 {name}")
                 if not self._save_items_tolerant(pwd_id=str(pwd_id), stoken=str(stoken), to_pdir_fid=dest_root_fid, items=[raw], context=name):
                     continue
+                self._line(f"转存目录: {name}")
                 tree.create_node(f"📁{name}", f"dir-new-{fid}", parent="root")
 
             if self._subdir_sync_failures:
@@ -1293,6 +1312,16 @@ class DramaTaskExecutor:
         if tree.size() <= 1:
             tree.create_node("无可转存文件", "empty", parent="root")
             self._line("无可转存文件")
+        else:
+            self._section("转存结果")
+            self._line(f"本次新增文件数: {self.transfer_count}")
+            if self.saved_history_entries:
+                self._line_file_details(
+                    [
+                        (str(entry.get("origin_name") or ""), str(entry.get("target_name") or ""))
+                        for entry in self.saved_history_entries
+                    ]
+                )
         setattr(tree, "_changed_relative_dirs", sorted(self.changed_relative_dirs))
         setattr(tree, "_transferred_history_entries", list(self.saved_history_entries))
         self._set_stage("end")
