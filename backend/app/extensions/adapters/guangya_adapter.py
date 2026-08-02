@@ -465,6 +465,9 @@ class GuangyaAdapter(BaseCloudDriveAdapter):
         "access_token": "",
         "refresh_token": "",
         "device_id": "",
+        "lsdir_cache_path": "",
+        "static_lsdir_cache_path": "",
+        "strm_scan_path": "",
     }
     config_fields = [
         {
@@ -503,6 +506,33 @@ class GuangyaAdapter(BaseCloudDriveAdapter):
             "secret": False,
             "placeholder": "自动生成",
         },
+        {
+            "key": "lsdir_cache_path",
+            "label": "缓存路径",
+            "description": "lsdir 缓存刷新与网盘同步默认范围使用的根目录（网盘内路径）。",
+            "input_type": "text",
+            "required": False,
+            "secret": False,
+            "placeholder": "/",
+        },
+        {
+            "key": "static_lsdir_cache_path",
+            "label": "静态缓存路径",
+            "description": "只做一次首扫并生成 lsdir 缓存的静态目录，适合完结类资源；仅在首次成功扫描或修改此配置后重扫，若位于缓存路径子树内会被普通扫描自动忽略。",
+            "input_type": "text",
+            "required": False,
+            "secret": False,
+            "placeholder": "/电影库",
+        },
+        {
+            "key": "strm_scan_path",
+            "label": "STRM 扫描路径",
+            "description": "STRM/CAS 使用的扫描根目录（网盘内路径）；支持英文逗号分隔多路径，为空时默认与缓存路径一致。",
+            "input_type": "text",
+            "required": False,
+            "secret": False,
+            "placeholder": "/影视,/动漫",
+        }
     ]
 
     def __init__(

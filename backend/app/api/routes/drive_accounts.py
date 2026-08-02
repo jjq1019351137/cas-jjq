@@ -69,7 +69,7 @@ def _lsdir_refresh_status_payload(account_id: int | None) -> dict[str, object] |
 
 
 def _reload_dl302_if_needed(drive_type: str | None) -> None:
-    if str(drive_type or "") not in {"115", "cloud189", "cloud139", "quark", "uc"}:
+    if str(drive_type or "") not in {"115", "cloud189", "cloud139", "quark", "uc", "guangya"}:
         return
     ok, msg = reload_dl302()
     if not ok:

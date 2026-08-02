@@ -542,7 +542,7 @@ onBeforeUnmount(stopPoller)
         <div class="space-y-5">
           <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">驱动账号</h3>
           <div v-if="!drivers.length" class="rounded-xl border border-dashed border-[hsl(var(--border))] py-12 text-center text-sm text-[hsl(var(--muted-foreground))]">暂无支持 302 的驱动账号</div>
-          <div v-for="driver in drivers" :key="driver.code" class="space-y-3">
+          <div v-for="driver in drivers.filter(d => d.code !== 'guangya')" :key="driver.code" class="space-y-3">
             <div class="flex flex-wrap items-center gap-2">
               <span class="text-sm font-semibold text-[hsl(var(--foreground))]">{{ driver.drive_name }}</span>
               <span class="rounded-full bg-[hsl(var(--muted))] px-2 py-0.5 text-[11px] text-[hsl(var(--muted-foreground))]">

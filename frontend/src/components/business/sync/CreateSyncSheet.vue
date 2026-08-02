@@ -31,7 +31,7 @@ const updateMutation = useUpdateSyncTaskMutation()
 const { data: accountsData } = useDriveAccountsQuery()
 const { data: dramaTasks } = useTasksQuery()
 
-const SUPPORTED_NETDISK_DRIVE_TYPES = ['115', 'cloud139', 'cloud189', 'uc', 'quark'] as const
+const SUPPORTED_NETDISK_DRIVE_TYPES = ['115', 'cloud139', 'cloud189', 'uc', 'quark', 'guangya'] as const
 
 const availableAccounts = computed(() =>
   (accountsData.value ?? [])

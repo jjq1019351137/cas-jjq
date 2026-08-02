@@ -64,6 +64,7 @@ _DRIVE_TYPE_ROUTE_MAP = {
     "cloud189": "/dl/189",
     "quark": "/dl/quark",
     "uc": "/dl/uc",
+    "guangya": "/dl/guangya",
 }
 
 _MANIFEST_PREFIX = ".dl302_strm_manifest_"

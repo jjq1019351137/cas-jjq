@@ -143,7 +143,7 @@ def _resolve_account(
     if account is None:
         raise not_found("DL302_CAS_ACCOUNT_NOT_FOUND", "驱动账号不存在")
     drive_type = str(getattr(account, "drive_type", "") or "").strip()
-    if drive_type not in {"115", "cloud139", "cloud189", "quark", "uc"}:
+    if drive_type not in {"115", "cloud139", "cloud189", "quark", "uc", "guangya"}:
         raise bad_request("DL302_CAS_DRIVE_UNSUPPORTED", "当前账号类型不支持 dl302 CAS 生成")
     media_base_paths = _extract_account_media_base_paths(account)
     if require_media_base_path and not media_base_paths:

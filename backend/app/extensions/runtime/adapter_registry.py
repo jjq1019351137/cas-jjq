@@ -7,7 +7,7 @@ from app.extensions.adapters.adapter_factory import AdapterFactory
 
 
 class AdapterRegistry:
-    _DL302_LEGACY_PATH_DRIVE_TYPES = {"115", "cloud189", "cloud139", "quark", "uc"}
+    _DL302_LEGACY_PATH_DRIVE_TYPES = {"115", "cloud189", "cloud139", "quark", "uc", "guangya"}
     _DL302_CACHE_PATH_KEY = "lsdir_cache_path"
     _DL302_LEGACY_CACHE_PATH_KEYS = ("302_path", "302Path")
 
