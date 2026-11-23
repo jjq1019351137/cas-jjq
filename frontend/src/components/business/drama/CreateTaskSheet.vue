@@ -248,15 +248,6 @@ function formatSize(bytes: number): string {
   return (bytes / 1073741824).toFixed(2) + 'GB'
 }
 
-function formatTime(ts: any): string {
-  if (!ts) return '-'
-  try {
-    const d = new Date(ts)
-    if (isNaN(d.getTime())) return '-'
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  } catch { return '-' }
-}
-
 // Sync state from editTask
 /**
  * 已初始化的表单标识：避免弹窗打开期间任务列表 refetch（如“验证全部”/“设为主链接”触发

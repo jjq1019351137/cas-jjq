@@ -13,6 +13,7 @@ import {
   checkTaskShareUrls,
   activateTaskShareUrl,
 } from '@/api/tasks'
+import type { TaskSchedulerSetting } from '@/types/tasks'
 
 export function useCreateTaskMutation() {
   const queryClient = useQueryClient()
@@ -83,7 +84,7 @@ export function useSyncSnapshotsMutation() {
 export function useUpdateSchedulerMutation() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (data: { crontab: string; timezone: string; enabled: boolean }) => updateTaskSchedulerSetting(data),
+    mutationFn: (data: Partial<TaskSchedulerSetting>) => updateTaskSchedulerSetting(data),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['task-scheduler-setting'] }) },
   })
 }
