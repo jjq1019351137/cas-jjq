@@ -18,7 +18,11 @@ class TaskBase(BaseModel):
     enddate: str | None = Field(default=None, max_length=32)
     ignore_extension: bool = False
     sort_index: int | None = None
-    startfid: str | None = Field(default=None, max_length=128)
+    startfid: str | None = Field(
+        default=None,
+        max_length=128,
+        description="起始集数锚点（如 S01E92 / E92）。按重命名后剧集号过滤，转存 >= 该集；兼容旧版网盘文件 FID。",
+    )
     account_name: str | None = Field(default=None, max_length=128)
     update_subdir: str | None = Field(default=None, max_length=255)
     tmdb_id: int | None = None
@@ -44,7 +48,11 @@ class TaskUpdateIn(BaseModel):
     enddate: str | None = Field(default=None, max_length=32)
     ignore_extension: bool | None = None
     sort_index: int | None = None
-    startfid: str | None = Field(default=None, max_length=128)
+    startfid: str | None = Field(
+        default=None,
+        max_length=128,
+        description="起始集数锚点（如 S01E92 / E92）。按重命名后剧集号过滤，转存 >= 该集；兼容旧版网盘文件 FID。",
+    )
     account_name: str | None = Field(default=None, max_length=128)
     update_subdir: str | None = Field(default=None, max_length=255)
     tmdb_id: int | None = None

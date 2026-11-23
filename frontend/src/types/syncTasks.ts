@@ -13,10 +13,14 @@ export type SyncEndpoint = {
 export type SyncStrategy = {
   overwrite: boolean
   one_way_delete_extras: boolean
+  /** 删除多余文件延时（分钟）：0/5/10/.../30，0=立即删除 */
+  one_way_delete_extras_delay_minutes?: number
   force_refresh: boolean
   concurrency: number
   request_interval_seconds: number
   openlist_copy_batch_size: number
+  /** 同步 zip 后自动解压、按前缀重命名并删除 zip */
+  unzip_zip_after_sync?: boolean
   auto_wash?: boolean
 }
 

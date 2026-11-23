@@ -26,6 +26,23 @@ export default defineConfig({
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
+  server: {
+    host: true,
+    port: 5173,
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        // 长连接 / SSE（任务流式日志等）
+        timeout: 0,
+      },
+      "/dl": {
+        target: "http://127.0.0.1:9000",
+        changeOrigin: true,
+        timeout: 0,
+      },
+    },
+  },
   build: {
     rollupOptions: {
       output: {

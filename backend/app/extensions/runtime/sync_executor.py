@@ -8,6 +8,8 @@ import secrets
 import shutil
 import threading
 import time
+import zipfile
+import tempfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -91,10 +93,12 @@ class Endpoint:
 class Strategy:
     overwrite: bool
     one_way_delete_extras: bool
+    one_way_delete_extras_delay_minutes: int
     force_refresh: bool
     concurrency: int
     request_interval_seconds: float
     openlist_copy_batch_size: int
+    unzip_zip_after_sync: bool
 
 
 class SyncCancelled(Exception):
@@ -385,10 +389,12 @@ class SyncExecutor:
                     {
                         "overwrite": bool(strategy.overwrite),
                         "one_way_delete_extras": bool(strategy.one_way_delete_extras),
+                        "one_way_delete_extras_delay_minutes": int(strategy.one_way_delete_extras_delay_minutes),
                         "force_refresh": bool(strategy.force_refresh),
                         "concurrency": int(strategy.concurrency),
                         "request_interval_seconds": float(strategy.request_interval_seconds),
                         "openlist_copy_batch_size": int(strategy.openlist_copy_batch_size),
+                        "unzip_zip_after_sync": bool(strategy.unzip_zip_after_sync),
                     },
                     ensure_ascii=False,
                 ),
@@ -786,10 +792,12 @@ class SyncExecutor:
                             "strategy": {
                                 "overwrite": bool(strategy.overwrite),
                                 "one_way_delete_extras": bool(strategy.one_way_delete_extras),
+                                "one_way_delete_extras_delay_minutes": int(strategy.one_way_delete_extras_delay_minutes),
                                 "force_refresh": bool(strategy.force_refresh),
                                 "concurrency": int(strategy.concurrency),
                                 "request_interval_seconds": float(strategy.request_interval_seconds),
                                 "openlist_copy_batch_size": int(strategy.openlist_copy_batch_size),
+                                "unzip_zip_after_sync": bool(strategy.unzip_zip_after_sync),
                             },
                             "addition": addition,
                             "execution_id": int(getattr(execution, "id", 0) or 0),
@@ -944,13 +952,18 @@ class SyncExecutor:
                 v = default
             return max(lo, min(hi, v))
 
+        delay_raw = _i("one_way_delete_extras_delay_minutes", 0, 0, 30)
+        # 仅允许 0 或 5 的倍数，非法值向下取整到合法档位
+        delay_minutes = 0 if delay_raw <= 0 else min(30, (delay_raw // 5) * 5)
         return Strategy(
             overwrite=_b("overwrite", False),
             one_way_delete_extras=_b("one_way_delete_extras", False),
+            one_way_delete_extras_delay_minutes=delay_minutes,
             force_refresh=_b("force_refresh", False),
             concurrency=_i("concurrency", 4, 1, 32),
             request_interval_seconds=_f("request_interval_seconds", 0.0, 0.0, 5.0),
             openlist_copy_batch_size=_i("openlist_copy_batch_size", 200, 1, 5000),
+            unzip_zip_after_sync=_b("unzip_zip_after_sync", True),
         )
 
     def _scan_endpoint(self, endpoint: Endpoint, *, strategy: Strategy, cancel_checker: _CancelChecker | None = None) -> dict[str, FileMeta]:
@@ -1318,31 +1331,9 @@ class SyncExecutor:
         if not actions:
             return
 
-        local_actions: list[dict[str, Any]] = []
-        server_actions: list[dict[str, Any]] = []
-        for a in actions:
-            src = a.get("src")
-            dst = a.get("dst")
-            if a.get("kind") == "delete":
-                if isinstance(dst, Endpoint) and dst.type == "openlist":
-                    server_actions.append(a)
-                else:
-                    local_actions.append(a)
-                continue
-            if a.get("kind") == "copy":
-                src_rel = str(a.get("src_rel") or "")
-                dst_rel = str(a.get("dst_rel") or "")
-                if (
-                    isinstance(src, Endpoint)
-                    and isinstance(dst, Endpoint)
-                    and src.type == "openlist"
-                    and dst.type == "openlist"
-                    and _norm_rel(src_rel) == _norm_rel(dst_rel)
-                ):
-                    server_actions.append(a)
-                else:
-                    local_actions.append(a)
-                continue
+        copy_actions = [a for a in actions if a.get("kind") == "copy"]
+        delete_actions = [a for a in actions if a.get("kind") == "delete"]
+        other_actions = [a for a in actions if a.get("kind") not in {"copy", "delete"}]
 
         finished: set[str] = set()
 
@@ -1370,6 +1361,8 @@ class SyncExecutor:
                         stats["copied_files"] = int(stats.get("copied_files") or 0) + 1
                     elif action == "delete":
                         stats["deleted_files"] = int(stats.get("deleted_files") or 0) + 1
+                    elif action == "unzip":
+                        stats["unzipped_files"] = int(stats.get("unzipped_files") or 0) + 1
                 elif status == "skipped":
                     stats["skipped_files"] = int(stats.get("skipped_files") or 0) + 1
                 else:
@@ -1398,26 +1391,94 @@ class SyncExecutor:
         def flush_now() -> None:
             on_persist(True)
 
-        if server_actions:
-            self._apply_server_actions(
-                server_actions,
-                strategy=strategy,
-                log=log,
-                push_event=_append_event,
-                flush_now=flush_now,
-                cancel_checker=cancel_checker,
-            )
+        def _dispatch(batch: list[dict[str, Any]]) -> None:
+            if not batch:
+                return
+            local_actions: list[dict[str, Any]] = []
+            server_actions: list[dict[str, Any]] = []
+            for a in batch:
+                src = a.get("src")
+                dst = a.get("dst")
+                if a.get("kind") == "delete":
+                    if isinstance(dst, Endpoint) and dst.type == "openlist":
+                        server_actions.append(a)
+                    else:
+                        local_actions.append(a)
+                    continue
+                if a.get("kind") == "copy":
+                    src_rel = str(a.get("src_rel") or "")
+                    dst_rel = str(a.get("dst_rel") or "")
+                    if (
+                        isinstance(src, Endpoint)
+                        and isinstance(dst, Endpoint)
+                        and src.type == "openlist"
+                        and dst.type == "openlist"
+                        and _norm_rel(src_rel) == _norm_rel(dst_rel)
+                    ):
+                        server_actions.append(a)
+                    else:
+                        local_actions.append(a)
+                    continue
+            if server_actions:
+                self._apply_server_actions(
+                    server_actions,
+                    strategy=strategy,
+                    log=log,
+                    push_event=_append_event,
+                    flush_now=flush_now,
+                    cancel_checker=cancel_checker,
+                )
+            if local_actions:
+                self._apply_local_actions(
+                    local_actions,
+                    strategy=strategy,
+                    log=log,
+                    push_event=_append_event,
+                    display_path=display_path,
+                    flush_now=flush_now,
+                    cancel_checker=cancel_checker,
+                )
 
-        if local_actions:
-            self._apply_local_actions(
-                local_actions,
-                strategy=strategy,
-                log=log,
-                push_event=_append_event,
-                display_path=display_path,
-                flush_now=flush_now,
-                cancel_checker=cancel_checker,
-            )
+        # 1) 先复制
+        _dispatch(copy_actions + other_actions)
+
+        # 2) 单向删除多余：可选延时（同步执行仍占用，可取消）
+        if delete_actions:
+            delay_min = int(getattr(strategy, "one_way_delete_extras_delay_minutes", 0) or 0)
+            if delay_min > 0:
+                log.set_stage("delete_delay")
+                log.section("删除多余文件延时")
+                log.line(f"延时 {delay_min} 分钟后删除多余文件（可取消）")
+                on_persist(True)
+                deadline = _now_ts() + float(delay_min) * 60.0
+                while True:
+                    if cancel_checker is not None:
+                        cancel_checker.raise_if_cancelled()
+                    remain = deadline - _now_ts()
+                    if remain <= 0:
+                        break
+                    time.sleep(min(5.0, remain))
+                log.line("延时结束，开始删除多余文件")
+            _dispatch(delete_actions)
+
+        # 3) 复制成功的 zip：解压 → 按前缀重命名 → 删 zip（放在删除多余之后，避免解压出的文件被当成多余删掉）
+        if bool(getattr(strategy, "unzip_zip_after_sync", True)):
+            zip_targets = [
+                a
+                for a in copy_actions
+                if str(a.get("dst_rel") or "").lower().endswith(".zip") and isinstance(a.get("dst"), Endpoint)
+            ]
+            if zip_targets:
+                log.set_stage("unzip_zip")
+                log.section("解压同步的 ZIP")
+                self._unzip_synced_zips(
+                    zip_targets,
+                    strategy=strategy,
+                    log=log,
+                    push_event=_append_event,
+                    display_path=display_path,
+                    cancel_checker=cancel_checker,
+                )
 
         on_persist(True)
 
@@ -2181,6 +2242,256 @@ class SyncExecutor:
             except Exception:
                 pass
         return "success"
+
+    def _unzip_synced_zips(
+        self,
+        zip_actions: list[dict[str, Any]],
+        *,
+        strategy: Strategy,
+        log: ExecutionLog,
+        push_event: Callable[..., dict[str, Any]],
+        display_path: Callable[[Endpoint, str], str],
+        cancel_checker: _CancelChecker | None,
+    ) -> None:
+        seen: set[tuple[str, str, str]] = set()
+        for a in zip_actions:
+            if cancel_checker is not None:
+                cancel_checker.raise_if_cancelled()
+            dst = a.get("dst")
+            dst_rel = _norm_rel(str(a.get("dst_rel") or ""))
+            if not isinstance(dst, Endpoint) or not dst_rel.lower().endswith(".zip"):
+                continue
+            key = (dst.type, dst.path, dst_rel)
+            if key in seen:
+                continue
+            seen.add(key)
+            path = display_path(dst, dst_rel)
+            push_event("unzip", "syncing", path)
+            try:
+                if dst.type == "local":
+                    self._unzip_local_zip(dst, dst_rel, strategy=strategy, log=log)
+                elif dst.type == "openlist":
+                    self._unzip_openlist_zip(
+                        dst,
+                        dst_rel,
+                        strategy=strategy,
+                        log=log,
+                        cancel_checker=cancel_checker,
+                    )
+                else:
+                    # netdisk：暂不支持服务端解压，跳过
+                    push_event("unzip", "skipped", path, message="netdisk_unsupported")
+                    continue
+                push_event("unzip", "success", path)
+            except Exception as e:
+                msg = str(e).strip() or type(e).__name__
+                log.line(f"[fail] unzip {path}: {msg}")
+                push_event("unzip", "failed", path, message=msg)
+
+    def _unzip_local_zip(self, dst: Endpoint, dst_rel: str, *, strategy: Strategy, log: ExecutionLog) -> None:
+        root = _local_sync_root()
+        base = _resolve_local_path(root, dst.path)
+        zip_path = _resolve_local_path(base, dst_rel)
+        if not zip_path.exists() or not zip_path.is_file():
+            raise FileNotFoundError(f"zip not found: {zip_path}")
+        stem = zip_path.stem
+        parent = zip_path.parent
+        with tempfile.TemporaryDirectory(prefix="casx-unzip-") as tmp:
+            tmp_dir = Path(tmp)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp_dir)
+            extracted_files = [p for p in tmp_dir.rglob("*") if p.is_file()]
+            if not extracted_files:
+                log.line(f"unzip: {zip_path.name} 内无文件")
+            elif len(extracted_files) == 1:
+                src_file = extracted_files[0]
+                target_name = f"{stem}{src_file.suffix}"
+                target_path = parent / target_name
+                if target_path.exists() and not strategy.overwrite:
+                    log.line(f"unzip skip exists: {target_name}")
+                else:
+                    if target_path.exists():
+                        target_path.unlink()
+                    shutil.move(str(src_file), str(target_path))
+                    log.line(f"unzip rename: {src_file.name} -> {target_name}")
+            else:
+                for idx, src_file in enumerate(extracted_files, start=1):
+                    # 多文件：{zip前缀}_{原名}
+                    target_name = f"{stem}_{src_file.name}"
+                    target_path = parent / target_name
+                    if target_path.exists() and not strategy.overwrite:
+                        log.line(f"unzip skip exists: {target_name}")
+                        continue
+                    if target_path.exists():
+                        target_path.unlink()
+                    shutil.move(str(src_file), str(target_path))
+                    log.line(f"unzip rename[{idx}]: {src_file.name} -> {target_name}")
+        zip_path.unlink()
+        log.line(f"unzip removed zip: {zip_path.name}")
+
+    def _unzip_openlist_zip(
+        self,
+        dst: Endpoint,
+        dst_rel: str,
+        *,
+        strategy: Strategy,
+        log: ExecutionLog,
+        cancel_checker: _CancelChecker | None = None,
+    ) -> None:
+        client = self._get_openlist_client()
+        abs_zip = _join_openlist(dst.path, dst_rel)
+        dir_path = posixpath.dirname(abs_zip) or "/"
+        zip_name = posixpath.basename(abs_zip)
+        stem = os.path.splitext(zip_name)[0]
+
+        # 解压前先列目录，便于对比新增文件
+        before_names = self._list_openlist_names(client, dir_path)
+
+        payload = {
+            "src_dir": dir_path,
+            "dst_dir": dir_path,
+            "name": [zip_name],
+            "password": "",
+            "cache_full": False,
+            "put_into_new_dir": False,
+        }
+        log.line(f"openlist decompress: {abs_zip}")
+        resp = client.fs_archive_decompress(payload)
+        # 等待 decompress 任务（若返回 tasks）
+        data = resp.get("data") if isinstance(resp, dict) else None
+        tasks = []
+        if isinstance(data, dict):
+            tasks = data.get("tasks") or []
+        elif isinstance(data, list):
+            tasks = data
+        if isinstance(tasks, list) and tasks:
+            wait_tasks = [t for t in tasks if isinstance(t, dict) and str(t.get("id") or t.get("tid") or "").strip()]
+            if wait_tasks:
+                self._wait_openlist_tasks(
+                    client,
+                    "decompress",
+                    wait_tasks,
+                    log=log,
+                    cancel_checker=cancel_checker,
+                )
+
+        after_names = self._list_openlist_names(client, dir_path)
+        new_names = [n for n in after_names if n not in before_names and n != zip_name and not n.startswith(".")]
+        # 若 put_into_new_dir=false 仍可能解压到同名目录
+        if not new_names and stem in after_names:
+            # 目录场景：列出 stem/ 下文件并上移重命名
+            sub_dir = posixpath.normpath(posixpath.join(dir_path, stem))
+            sub_names = self._list_openlist_file_names(client, sub_dir)
+            if len(sub_names) == 1:
+                old = sub_names[0]
+                ext = os.path.splitext(old)[1]
+                new_name = f"{stem}{ext}"
+                try:
+                    client.fs_move(sub_dir, dir_path, [old])
+                except Exception:
+                    pass
+                moved_abs = posixpath.normpath(posixpath.join(dir_path, old))
+                if old != new_name:
+                    try:
+                        client.fs_rename(moved_abs, new_name, overwrite=bool(strategy.overwrite))
+                    except Exception as e:
+                        log.line(f"openlist rename warn: {old} -> {new_name} err={e}")
+                try:
+                    client.fs_remove(dir_path, [stem])
+                except Exception:
+                    pass
+                log.line(f"unzip rename: {old} -> {new_name}")
+            else:
+                for old in sub_names:
+                    new_name = f"{stem}_{old}"
+                    try:
+                        client.fs_move(sub_dir, dir_path, [old])
+                        moved_abs = posixpath.normpath(posixpath.join(dir_path, old))
+                        if old != new_name:
+                            client.fs_rename(moved_abs, new_name, overwrite=bool(strategy.overwrite))
+                        log.line(f"unzip rename: {old} -> {new_name}")
+                    except Exception as e:
+                        log.line(f"openlist rename fail: {old} err={e}")
+                try:
+                    client.fs_remove(dir_path, [stem])
+                except Exception:
+                    pass
+        elif len(new_names) == 1:
+            old = new_names[0]
+            ext = os.path.splitext(old)[1]
+            new_name = f"{stem}{ext}"
+            if old != new_name:
+                old_abs = posixpath.normpath(posixpath.join(dir_path, old))
+                client.fs_rename(old_abs, new_name, overwrite=bool(strategy.overwrite))
+                log.line(f"unzip rename: {old} -> {new_name}")
+        else:
+            for old in new_names:
+                if old.startswith(stem):
+                    continue
+                new_name = f"{stem}_{old}"
+                if old == new_name:
+                    continue
+                old_abs = posixpath.normpath(posixpath.join(dir_path, old))
+                try:
+                    client.fs_rename(old_abs, new_name, overwrite=bool(strategy.overwrite))
+                    log.line(f"unzip rename: {old} -> {new_name}")
+                except Exception as e:
+                    log.line(f"openlist rename fail: {old} err={e}")
+
+        try:
+            client.fs_remove(dir_path, [zip_name])
+            log.line(f"unzip removed zip: {zip_name}")
+        except Exception as e:
+            log.line(f"unzip remove zip warn: {zip_name} err={e}")
+
+    def _list_openlist_names(self, client: Any, dir_path: str) -> set[str]:
+        names: set[str] = set()
+        page = 1
+        while True:
+            resp = client.fs_list(dir_path, refresh=(page == 1), page=page, per_page=200)
+            data = resp.get("data") if isinstance(resp, dict) else None
+            content = []
+            if isinstance(data, dict):
+                content = data.get("content") or data.get("items") or data.get("list") or data.get("files") or []
+            if not isinstance(content, list):
+                content = []
+            for item in content:
+                if isinstance(item, dict):
+                    n = str(item.get("name") or "").strip()
+                    if n:
+                        names.add(n)
+            if len(content) < 200:
+                break
+            page += 1
+            if page > 50:
+                break
+        return names
+
+    def _list_openlist_file_names(self, client: Any, dir_path: str) -> list[str]:
+        files: list[str] = []
+        page = 1
+        while True:
+            resp = client.fs_list(dir_path, refresh=(page == 1), page=page, per_page=200)
+            data = resp.get("data") if isinstance(resp, dict) else None
+            content = []
+            if isinstance(data, dict):
+                content = data.get("content") or data.get("items") or data.get("list") or data.get("files") or []
+            if not isinstance(content, list):
+                content = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if bool(item.get("is_dir")):
+                    continue
+                n = str(item.get("name") or "").strip()
+                if n:
+                    files.append(n)
+            if len(content) < 200:
+                break
+            page += 1
+            if page > 50:
+                break
+        return files
 
     def _delete_at(self, dst: Endpoint, dst_rel: str) -> str:
         dst_rel = _norm_rel(dst_rel)

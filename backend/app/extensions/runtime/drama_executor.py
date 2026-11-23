@@ -18,6 +18,12 @@ from app.core.settings import settings
 from app.extensions.runtime.execution_log import ExecutionLog
 from app.extensions.runtime.magic_rename import MagicRename
 from app.extensions.runtime.retry_utils import RetryResult, retry_call, summarize_payload
+from app.services.start_episode_filter import (
+    episode_key_from_renamed_name,
+    format_episode_anchor,
+    is_before_start_episode,
+    resolve_start_episode_key,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -869,22 +875,44 @@ class DramaTaskExecutor:
             except Exception:
                 return None
 
-        start_ts = None
-        fid_keep = None
-        if startfid:
-            start_item = next((f for f in share_files if str(_get_fid(f)).strip() == startfid), None)
-            if start_item:
-                start_ts = _to_ts(_get_updated_at(start_item))
-                if start_ts is None:
-                    sorted_list = sorted(share_files, key=lambda x: _to_ts(_get_updated_at(x)) or 0, reverse=True)
-                    kept: list[str] = []
-                    for f in sorted_list:
-                        fid = str(_get_fid(f)).strip()
-                        if fid == startfid:
-                            break
-                        if fid:
-                            kept.append(fid)
-                    fid_keep = set(kept)
+        def _rename_preview(origin_name: str) -> str:
+            if filter_only_mode:
+                return origin_name
+            if (not disable_guessit_fallback) and (not pattern.strip()) and (not replace.strip()) and bool(tmdb_series_title):
+                if not _is_video_name(origin_name):
+                    return origin_name
+                try:
+                    from app.extensions.runtime.guessit_fallback import guessit_media_target
+
+                    target = guessit_media_target(
+                        origin_name,
+                        media_type=tmdb_media_type,
+                        tmdb_title=tmdb_series_title,
+                        tmdb_year=tmdb_year,
+                        tv_seasons=tmdb_tv_seasons,
+                        tv_rename_template=str(self.task_data.get("guessit_tmdb_tv_rename_template") or "").strip() or None,
+                        movie_rename_template=str(self.task_data.get("guessit_tmdb_movie_rename_template") or "").strip() or None,
+                        trace_tag="drama_plan",
+                    )
+                    return target or mr.sub(pattern, replace, origin_name)
+                except Exception:
+                    return mr.sub(pattern, replace, origin_name)
+            return mr.sub(pattern, replace, origin_name)
+
+        start_episode_key = resolve_start_episode_key(
+            startfid,
+            share_files=share_files,
+            rename_name=_rename_preview,
+            get_fid=_get_fid,
+            get_name=_get_name,
+        )
+        if startfid and start_episode_key is None:
+            self._line(f"提示: 起始锚点无法解析为集数，已忽略 start={startfid}")
+        elif start_episode_key is not None:
+            self._line(
+                f"起始集数过滤: >= {format_episode_anchor(start_episode_key[0], start_episode_key[1])} "
+                f"(原始={startfid})"
+            )
 
         dest_filename_list = []
         for raw in dest_file_list:
@@ -902,12 +930,6 @@ class DramaTaskExecutor:
             updated_at = _get_updated_at(raw)
             if not fid or not origin_name:
                 continue
-            if startfid:
-                if start_ts is not None:
-                    if (_to_ts(updated_at) or 0) <= start_ts:
-                        continue
-                elif fid_keep is not None and fid not in fid_keep:
-                    continue
             search_re = compiled_subdir if (compiled_subdir and _is_dir(raw)) else compiled_search
             if search_re and not search_re.search(origin_name):
                 continue
@@ -919,24 +941,13 @@ class DramaTaskExecutor:
                     if not _is_video_name(origin_name):
                         self._line(f"跳过: guessit 兜底仅处理视频文件 {origin_name}")
                         continue
-                    try:
-                        from app.extensions.runtime.guessit_fallback import guessit_media_target
-
-                        target = guessit_media_target(
-                                origin_name,
-                                media_type=tmdb_media_type,
-                                tmdb_title=tmdb_series_title,
-                                tmdb_year=tmdb_year,
-                                tv_seasons=tmdb_tv_seasons,
-                                tv_rename_template=str(self.task_data.get("guessit_tmdb_tv_rename_template") or "").strip() or None,
-                                movie_rename_template=str(self.task_data.get("guessit_tmdb_movie_rename_template") or "").strip() or None,
-                                trace_tag="drama_plan",
-                            )
-                        file_name_re = target or mr.sub(pattern, replace, origin_name)
-                    except Exception:
-                        file_name_re = mr.sub(pattern, replace, origin_name)
+                    file_name_re = _rename_preview(origin_name)
                 else:
-                    file_name_re = mr.sub(pattern, replace, origin_name)
+                    file_name_re = _rename_preview(origin_name)
+                if start_episode_key is not None:
+                    file_key = episode_key_from_renamed_name(file_name_re)
+                    if is_before_start_episode(file_key, start_episode_key):
+                        continue
             if self._is_history_transferred(origin_name=origin_name, target_name=file_name_re):
                 self._line(f"跳过: 历史已转存 origin={origin_name} target={file_name_re}")
                 continue

@@ -15,8 +15,9 @@ import {
 } from '@/components/ui/alert-dialog'
 import {
   Plus, Search, Film, Play, Wrench, Square, Camera,
-  HardDrive, User, HelpCircle, X, CalendarCheck, Save,
+  HardDrive, User, HelpCircle, X, CalendarCheck, Save, FolderOpen, Loader2,
 } from 'lucide-vue-next'
+import { browseOpenList } from '@/api/openlist'
 import TaskCard from '@/components/business/drama/TaskCard.vue'
 import DramaTaskLauncher from '@/components/business/drama/DramaTaskLauncher.vue'
 import { useTasksQuery, useTaskSchedulerSettingQuery } from '@/hooks/queries/tasks'
@@ -66,6 +67,18 @@ const schedulerForm = reactive({
   enabled: false,
   crontab: '',
   timezone: 'Asia/Shanghai',
+  openlist_cleanup_enabled: false,
+  openlist_cleanup_path: '',
+  openlist_cleanup_crontab: '0 3 * * *',
+})
+
+const openlistPicker = reactive({
+  visible: false,
+  loading: false,
+  error: '',
+  currentPath: '/',
+  items: [] as Array<{ name: string; is_dir: boolean; path?: string }>,
+  paths: [] as Array<{ name: string; path?: string }>,
 })
 
 watch(
@@ -75,6 +88,9 @@ watch(
       schedulerForm.enabled = val.enabled
       schedulerForm.crontab = val.crontab || ''
       schedulerForm.timezone = val.timezone || 'Asia/Shanghai'
+      schedulerForm.openlist_cleanup_enabled = Boolean(val.openlist_cleanup_enabled)
+      schedulerForm.openlist_cleanup_path = String(val.openlist_cleanup_path || '')
+      schedulerForm.openlist_cleanup_crontab = String(val.openlist_cleanup_crontab || '0 3 * * *')
     }
   },
   { immediate: true },
@@ -231,12 +247,56 @@ function saveScheduler() {
       enabled: schedulerForm.enabled,
       crontab: schedulerForm.crontab,
       timezone: schedulerForm.timezone,
+      openlist_cleanup_enabled: schedulerForm.openlist_cleanup_enabled,
+      openlist_cleanup_path: schedulerForm.openlist_cleanup_path.trim(),
+      openlist_cleanup_crontab: schedulerForm.openlist_cleanup_crontab.trim() || '0 3 * * *',
     },
     {
       onSuccess: () => toast.success('调度配置已保存'),
       onError: (e: any) => toast.error(e?.message || '保存调度配置失败'),
     },
   )
+}
+
+async function openOpenlistCleanupPicker() {
+  openlistPicker.visible = true
+  openlistPicker.error = ''
+  openlistPicker.currentPath = schedulerForm.openlist_cleanup_path.trim() || '/'
+  await refreshOpenlistCleanupPicker()
+}
+
+async function refreshOpenlistCleanupPicker() {
+  openlistPicker.loading = true
+  openlistPicker.error = ''
+  try {
+    const res = await browseOpenList({ path: openlistPicker.currentPath || '/', max_items: 500 })
+    openlistPicker.currentPath = res.dir_path || openlistPicker.currentPath
+    openlistPicker.items = (res.items || []).filter((x) => x.is_dir)
+    openlistPicker.paths = res.paths || []
+  } catch (e: any) {
+    openlistPicker.error = e?.message || '浏览 OpenList 失败（请先在设置中配置 OpenList）'
+    openlistPicker.items = []
+    openlistPicker.paths = []
+  } finally {
+    openlistPicker.loading = false
+  }
+}
+
+function openlistPickerEnter(item: { name: string; path?: string }) {
+  openlistPicker.currentPath = item.path || `${openlistPicker.currentPath.replace(/\/+$/, '')}/${item.name}`
+  refreshOpenlistCleanupPicker()
+}
+
+function openlistPickerGoUp() {
+  const parts = openlistPicker.currentPath.replace(/\/+$/, '').split('/').filter(Boolean)
+  parts.pop()
+  openlistPicker.currentPath = parts.length ? `/${parts.join('/')}` : '/'
+  refreshOpenlistCleanupPicker()
+}
+
+function confirmOpenlistCleanupPath() {
+  schedulerForm.openlist_cleanup_path = openlistPicker.currentPath || '/'
+  openlistPicker.visible = false
 }
 
 // --- Per-task actions ---
@@ -360,36 +420,126 @@ function handleToggleStatus(task: TaskItem) {
           <Skeleton class="h-9 w-40 rounded-full" />
           <Skeleton class="h-9 w-40 rounded-full" />
         </div>
-        <div v-else class="flex flex-wrap items-center gap-x-5 gap-y-3">
-          <label class="flex cursor-pointer items-center gap-2 text-sm text-[hsl(var(--foreground))]">
-            <ToggleSwitch v-model="schedulerForm.enabled" />
-            启用调度
-          </label>
-          <div class="flex items-center gap-2">
-            <span class="flex items-center gap-1 text-sm text-[hsl(var(--muted-foreground))]">
-              Crontab
-              <a
-                href="http://tool.lu/crontab"
-                target="_blank"
-                rel="noopener noreferrer"
-                title="crontab 表达式在线工具（新页面打开）"
-                class="transition-colors hover:text-[hsl(var(--primary))]"
-              >
-                <HelpCircle class="h-3.5 w-3.5" />
-              </a>
-            </span>
-            <Input v-model="schedulerForm.crontab" placeholder="0 */6 * * *" class="h-9 w-40 rounded-full bg-[hsl(var(--background))]" />
+        <div v-else class="space-y-4">
+          <div class="flex flex-wrap items-center gap-x-5 gap-y-3">
+            <label class="flex cursor-pointer items-center gap-2 text-sm text-[hsl(var(--foreground))]">
+              <ToggleSwitch v-model="schedulerForm.enabled" />
+              启用调度
+            </label>
+            <div class="flex items-center gap-2">
+              <span class="flex items-center gap-1 text-sm text-[hsl(var(--muted-foreground))]">
+                Crontab
+                <a
+                  href="http://tool.lu/crontab"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="crontab 表达式在线工具（新页面打开）"
+                  class="transition-colors hover:text-[hsl(var(--primary))]"
+                >
+                  <HelpCircle class="h-3.5 w-3.5" />
+                </a>
+              </span>
+              <Input v-model="schedulerForm.crontab" placeholder="0 */6 * * *" class="h-9 w-40 rounded-full bg-[hsl(var(--background))]" />
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-sm text-[hsl(var(--muted-foreground))]">时区</span>
+              <Input v-model="schedulerForm.timezone" placeholder="Asia/Shanghai" class="h-9 w-40 rounded-full bg-[hsl(var(--background))]" />
+            </div>
           </div>
-          <div class="flex items-center gap-2">
-            <span class="text-sm text-[hsl(var(--muted-foreground))]">时区</span>
-            <Input v-model="schedulerForm.timezone" placeholder="Asia/Shanghai" class="h-9 w-40 rounded-full bg-[hsl(var(--background))]" />
+
+          <div class="rounded-xl border border-[hsl(var(--border))]/70 bg-[hsl(var(--background))]/40 px-3 py-3 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div class="text-sm font-medium text-[hsl(var(--foreground))]">OpenList 目录定时清理</div>
+                <p class="text-xs text-[hsl(var(--muted-foreground))] mt-0.5">
+                  按 crontab 定时递归删除所选网盘目录及其所有子目录下的 .mp4 / .zip / .mkv（依赖已配置的 OpenList）。
+                </p>
+              </div>
+              <label class="flex cursor-pointer items-center gap-2 text-sm text-[hsl(var(--foreground))]">
+                <ToggleSwitch v-model="schedulerForm.openlist_cleanup_enabled" />
+                启用清理
+              </label>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <Input
+                v-model="schedulerForm.openlist_cleanup_path"
+                placeholder="/path/to/folder 或点击选择"
+                class="h-9 min-w-[16rem] flex-1 rounded-full bg-[hsl(var(--background))]"
+              />
+              <Button size="sm" variant="outline" class="rounded-full" @click="openOpenlistCleanupPicker">
+                <FolderOpen class="mr-1 h-3.5 w-3.5" />
+                选择目录
+              </Button>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="flex items-center gap-1 text-sm text-[hsl(var(--muted-foreground))]">
+                清理时间（crontab）
+                <a
+                  href="http://tool.lu/crontab"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="transition-colors hover:text-[hsl(var(--primary))]"
+                >
+                  <HelpCircle class="h-3.5 w-3.5" />
+                </a>
+              </span>
+              <Input
+                v-model="schedulerForm.openlist_cleanup_crontab"
+                placeholder="0 3 * * *"
+                class="h-9 w-40 rounded-full bg-[hsl(var(--background))]"
+              />
+            </div>
           </div>
-          <Button size="sm" class="rounded-full" :disabled="schedulerMutation.isPending.value" @click="saveScheduler">
-            <Save class="mr-1 h-4 w-4" />
-            {{ schedulerMutation.isPending.value ? '保存中...' : '保存' }}
-          </Button>
+
+          <div>
+            <Button size="sm" class="rounded-full" :disabled="schedulerMutation.isPending.value" @click="saveScheduler">
+              <Save class="mr-1 h-4 w-4" />
+              {{ schedulerMutation.isPending.value ? '保存中...' : '保存' }}
+            </Button>
+          </div>
         </div>
       </div>
+
+      <!-- OpenList cleanup path picker -->
+      <Teleport to="body">
+        <div v-if="openlistPicker.visible" class="fixed inset-0 z-[100] flex items-center justify-center">
+          <div class="absolute inset-0 bg-black/50" @click="openlistPicker.visible = false" />
+          <div class="relative z-10 flex max-h-[75vh] w-[560px] flex-col overflow-hidden rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-xl">
+            <div class="flex items-center justify-between border-b border-[hsl(var(--border))] px-5 py-3">
+              <h3 class="text-sm font-semibold">选择 OpenList 清理目录</h3>
+              <button class="rounded-full p-1 hover:bg-[hsl(var(--muted))]" @click="openlistPicker.visible = false">
+                <X class="h-4 w-4" />
+              </button>
+            </div>
+            <div class="flex items-center gap-2 border-b border-[hsl(var(--border))] px-5 py-2 text-xs text-[hsl(var(--muted-foreground))]">
+              <button class="underline" @click="openlistPickerGoUp">上级</button>
+              <span class="truncate">{{ openlistPicker.currentPath }}</span>
+            </div>
+            <div class="flex-1 overflow-y-auto px-5 py-3">
+              <div v-if="openlistPicker.loading" class="flex justify-center py-8">
+                <Loader2 class="h-5 w-5 animate-spin text-[hsl(var(--muted-foreground))]" />
+              </div>
+              <div v-else-if="openlistPicker.error" class="py-4 text-center text-xs text-red-500">{{ openlistPicker.error }}</div>
+              <div v-else-if="!openlistPicker.items.length" class="py-4 text-center text-xs text-[hsl(var(--muted-foreground))]">无子目录</div>
+              <div v-else class="space-y-1">
+                <button
+                  v-for="item in openlistPicker.items"
+                  :key="item.path || item.name"
+                  class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-[hsl(var(--accent))]"
+                  @click="openlistPickerEnter(item)"
+                >
+                  <FolderOpen class="h-4 w-4 shrink-0 text-[hsl(var(--muted-foreground))]" />
+                  <span class="truncate">{{ item.name }}</span>
+                </button>
+              </div>
+            </div>
+            <div class="flex justify-end gap-2 border-t border-[hsl(var(--border))] px-5 py-3">
+              <Button size="sm" variant="outline" class="rounded-full" @click="openlistPicker.visible = false">取消</Button>
+              <Button size="sm" class="rounded-full" @click="confirmOpenlistCleanupPath">使用当前目录</Button>
+            </div>
+          </div>
+        </div>
+      </Teleport>
 
       <!-- Toolbar: search + batch actions + new task -->
       <div class="glass-panel mb-4 flex flex-wrap items-center gap-2 px-4 py-3">

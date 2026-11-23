@@ -200,8 +200,11 @@ def promote_link(db: Session, task_id: int, url: str) -> bool:
     task.shareurl_ban = None
     task.shareurl_list_json = json.dumps(links, ensure_ascii=False)
     if previous_active and previous_active != url:
-        # startfid 是旧主链接内的文件 fid，换链后失效，保留会使起始文件过滤静默失效
-        task.startfid = None
+        # 旧版 startfid 存的是网盘文件 FID，换链后失效；集数锚点（SxxExx）可跨链接保留
+        from app.services.start_episode_filter import is_episode_anchor
+
+        if not is_episode_anchor(getattr(task, "startfid", None)):
+            task.startfid = None
     db.flush()
     return True
 
@@ -259,8 +262,11 @@ def replace_active_link(
     links = set_share_links_from_urls(db, task, urls, source=source)
     now = _now_iso()
     if old_active and old_active != new_url:
-        # 换链后旧链接内的 startfid 失效，必须清空，否则起始文件过滤会静默失效
-        task.startfid = None
+        # 旧版 FID 锚点换链失效；集数锚点可保留
+        from app.services.start_episode_filter import is_episode_anchor
+
+        if not is_episode_anchor(getattr(task, "startfid", None)):
+            task.startfid = None
     for link in links:
         if link["url"] == new_url:
             link["status"] = STATUS_OK

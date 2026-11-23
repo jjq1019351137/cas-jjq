@@ -54,12 +54,15 @@ const targetPath = ref('/')
 const mode = ref<'one_way' | 'two_way'>('one_way')
 const overwrite = ref(false)
 const deleteExtras = ref(false)
+const deleteExtrasDelayMinutes = ref(0)
 const forceRefresh = ref(false)
 const autoWash = ref(true)
+const unzipZipAfterSync = ref(true)
 const concurrency = ref(4)
 const requestIntervalSeconds = ref(0)
 const openlistCopyBatchSize = ref(200)
 const dramaTaskUids = ref<string[]>([])
+const DELETE_DELAY_OPTIONS = [0, 5, 10, 15, 20, 25, 30] as const
 
 const targetDriveType = computed(() => {
   if (targetType.value !== 'netdisk' || targetAccountId.value == null) return ''
@@ -80,8 +83,10 @@ function resetForm() {
   mode.value = 'one_way'
   overwrite.value = false
   deleteExtras.value = false
+  deleteExtrasDelayMinutes.value = 0
   forceRefresh.value = false
   autoWash.value = true
+  unzipZipAfterSync.value = true
   concurrency.value = 4
   requestIntervalSeconds.value = 0
   openlistCopyBatchSize.value = 200
@@ -100,8 +105,11 @@ function fillFromTask(task: SyncTaskItem) {
   mode.value = task.mode
   overwrite.value = task.strategy.overwrite
   deleteExtras.value = task.strategy.one_way_delete_extras
+  const delay = Number(task.strategy.one_way_delete_extras_delay_minutes ?? 0)
+  deleteExtrasDelayMinutes.value = DELETE_DELAY_OPTIONS.includes(delay as any) ? delay : 0
   forceRefresh.value = task.strategy.force_refresh
   autoWash.value = task.strategy.auto_wash ?? true
+  unzipZipAfterSync.value = task.strategy.unzip_zip_after_sync ?? true
   concurrency.value = task.strategy.concurrency
   requestIntervalSeconds.value = task.strategy.request_interval_seconds
   openlistCopyBatchSize.value = task.strategy.openlist_copy_batch_size
@@ -139,10 +147,12 @@ function buildPayload() {
     strategy: {
       overwrite: overwrite.value,
       one_way_delete_extras: deleteExtras.value,
+      one_way_delete_extras_delay_minutes: deleteExtras.value ? deleteExtrasDelayMinutes.value : 0,
       force_refresh: forceRefresh.value,
       concurrency: concurrency.value,
       request_interval_seconds: requestIntervalSeconds.value,
       openlist_copy_batch_size: openlistCopyBatchSize.value,
+      unzip_zip_after_sync: unzipZipAfterSync.value,
       auto_wash: autoWash.value,
     },
     drama_task_uids: dramaTaskUids.value,
@@ -534,6 +544,27 @@ function closePicker() {
               <label class="flex items-center gap-3 cursor-pointer">
                 <input type="checkbox" v-model="deleteExtras" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
                 <span class="text-sm text-[hsl(var(--foreground))]">删除多余文件（单向模式）</span>
+              </label>
+
+              <div v-if="deleteExtras && mode === 'one_way'" class="space-y-1.5 pl-7">
+                <label class="text-sm font-medium text-[hsl(var(--foreground))]">删除延时</label>
+                <select
+                  v-model.number="deleteExtrasDelayMinutes"
+                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
+                >
+                  <option v-for="m in DELETE_DELAY_OPTIONS" :key="m" :value="m">
+                    {{ m === 0 ? '立即删除（0 分钟）' : `${m} 分钟后删除` }}
+                  </option>
+                </select>
+                <p class="text-xs text-[hsl(var(--muted-foreground))]">同步复制完成后再等待指定时间删除目标侧多余文件；执行中可取消。</p>
+              </div>
+
+              <label class="flex items-center gap-3 cursor-pointer">
+                <input type="checkbox" v-model="unzipZipAfterSync" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
+                <span class="text-sm text-[hsl(var(--foreground))]">
+                  同步 ZIP 后自动解压
+                  <span class="block text-xs text-[hsl(var(--muted-foreground))]">解压到同目录，按 zip 文件名前缀重命名，并删除原 zip（local / OpenList）。</span>
+                </span>
               </label>
 
               <label class="flex items-center gap-3 cursor-pointer">

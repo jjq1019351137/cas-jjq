@@ -347,14 +347,14 @@ class TaskExecutor:
         for index, url in enumerate(candidates, start=1):
             task_data["shareurl"] = url
             task_data["_failover_attempted"] = index
-            is_active_link = bool(active_url) and url == active_url
-            task_data["startfid"] = original_startfid if is_active_link else ""
+            # 起始锚点已改为集数（SxxExx），跨链接可复用，不再仅限主链接
+            task_data["startfid"] = original_startfid
             if total > 1:
                 log.set_stage("execute_drama")
                 log.section(f"分享链接 {index}/{total}")
                 log.line(f"链接: {url}")
-                if original_startfid and not is_active_link:
-                    log.line("说明: 非主链接不应用起始文件（startfid 仅对主链接有效）")
+                if original_startfid:
+                    log.line(f"说明: 起始集数锚点={original_startfid}（按重命名后剧集号过滤）")
             try:
                 tree = self._execute_drama_task(adapter, task_data, log)
             except SkipTask:

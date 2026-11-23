@@ -90,6 +90,9 @@ export type TaskSchedulerSetting = {
   enabled: boolean
   crontab: string
   timezone: string
+  openlist_cleanup_enabled?: boolean
+  openlist_cleanup_path?: string
+  openlist_cleanup_crontab?: string
 }
 
 export type StopCompletedDramaTasksResponse = {

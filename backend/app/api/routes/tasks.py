@@ -23,6 +23,12 @@ from app.extensions.runtime.adapter_registry import AdapterRegistry
 from app.extensions.runtime.account_manager import DatabaseAccountManager
 from app.extensions.runtime.execution_log import ExecutionLog
 from app.extensions.runtime.magic_rename import MagicRename
+from app.services.start_episode_filter import (
+    episode_key_from_renamed_name,
+    format_episode_anchor,
+    is_before_start_episode,
+    resolve_start_episode_key,
+)
 from app.models.drive_account import DriveAccount
 from app.models.sync_task_drama_link import SyncTaskDramaLink
 from app.models.task import Task
@@ -371,7 +377,14 @@ def _task_out(
 
 
 def _scheduler_out(item) -> TaskSchedulerSettingOut:
-    return TaskSchedulerSettingOut(enabled=item.enabled, crontab=item.crontab, timezone=item.timezone)
+    return TaskSchedulerSettingOut(
+        enabled=item.enabled,
+        crontab=item.crontab,
+        timezone=item.timezone,
+        openlist_cleanup_enabled=bool(getattr(item, "openlist_cleanup_enabled", False)),
+        openlist_cleanup_path=str(getattr(item, "openlist_cleanup_path", "") or ""),
+        openlist_cleanup_crontab=str(getattr(item, "openlist_cleanup_crontab", "") or "0 3 * * *"),
+    )
 
 
 def _pick_default_account_name(db: Session, drive_type: str) -> str | None:
@@ -1480,22 +1493,64 @@ def post_share_preview(payload: SharePreviewIn, db: Session = Depends(get_db)):
         except Exception:
             return None
 
-    start_ts = None
-    fid_keep = None
-    if startfid:
-        start_item = next((f for f in raw_items if str(_pick_fid(f)).strip() == startfid), None)
-        if start_item:
-            start_ts = _to_ts(_pick_updated_at(start_item))
-            if start_ts is None:
-                sorted_list = sorted(raw_items, key=lambda x: _to_ts(_pick_updated_at(x)) or 0, reverse=True)
-                kept: list[str] = []
-                for f in sorted_list:
-                    fid = str(_pick_fid(f)).strip()
-                    if fid == startfid:
-                        break
-                    if fid:
-                        kept.append(fid)
-                fid_keep = set(kept)
+    def _preview_rename(file_name: str) -> str:
+        if filter_only_mode or default_transfer_all_mode:
+            return file_name
+        if not disable_guessit_fallback and (not pattern.strip()) and (not replace.strip()) and bool(tmdb_series_title):
+            try:
+                from app.extensions.runtime.guessit_fallback import guessit_media_target
+
+                return (
+                    guessit_media_target(
+                        file_name,
+                        media_type=tmdb_media_type,
+                        tmdb_title=(str(tmdb_series_title) if tmdb_series_title else None),
+                        tmdb_year=tmdb_year,
+                        tv_seasons=tmdb_tv_seasons,
+                        tv_rename_template=tv_tpl or None,
+                        movie_rename_template=movie_tpl or None,
+                        trace_tag="preview",
+                    )
+                    or file_name
+                )
+            except Exception:
+                return file_name
+        try:
+            return mr.sub(pattern, replace, file_name)
+        except re.error as e:
+            detail = str(e)
+            if "invalid group reference" in detail:
+                raise bad_request(
+                    "TASK_REGEX_INVALID",
+                    "replace 规则不合法: 引用了不存在的捕获分组",
+                    detail=detail,
+                ) from e
+            raise bad_request(
+                "TASK_REGEX_INVALID",
+                f"replace 规则不合法: {detail}",
+            ) from e
+
+    start_episode_key = resolve_start_episode_key(
+        startfid,
+        share_files=raw_items,
+        rename_name=_preview_rename,
+        get_fid=_pick_fid,
+        get_name=_pick_name,
+    )
+    start_skip_label = (
+        f"起始集数之前(< {format_episode_anchor(start_episode_key[0], start_episode_key[1])})"
+        if start_episode_key is not None
+        else "起始集数之前"
+    )
+
+    def _mark_if_before_start(item: dict, renamed_name: str) -> bool:
+        if start_episode_key is None:
+            return False
+        file_key = episode_key_from_renamed_name(renamed_name)
+        if is_before_start_episode(file_key, start_episode_key):
+            item["file_name_saved"] = start_skip_label
+            return True
+        return False
 
     preview_list: list[dict] = []
     for raw in raw_items[: payload.max_items]:
@@ -1532,21 +1587,13 @@ def post_share_preview(payload: SharePreviewIn, db: Session = Depends(get_db)):
             continue
 
         if filter_only_mode:
-            if startfid:
-                if start_ts is not None:
-                    if (_to_ts(updated_at) or 0) <= start_ts:
-                        item["file_name_saved"] = "起始及之前"
-                        preview_list.append(item)
-                        continue
-                elif fid_keep is not None:
-                    if fid not in fid_keep:
-                        item["file_name_saved"] = "起始及之前"
-                        preview_list.append(item)
-                        continue
-
             matched = (not compiled_search) or bool(compiled_search.search(file_name))
             if not matched:
                 item["file_name_saved"] = "未命中过滤规则"
+                preview_list.append(item)
+                continue
+
+            if _mark_if_before_start(item, file_name):
                 preview_list.append(item)
                 continue
 
@@ -1559,17 +1606,9 @@ def post_share_preview(payload: SharePreviewIn, db: Session = Depends(get_db)):
             continue
 
         if default_transfer_all_mode:
-            if startfid:
-                if start_ts is not None:
-                    if (_to_ts(updated_at) or 0) <= start_ts:
-                        item["file_name_saved"] = "起始及之前"
-                        preview_list.append(item)
-                        continue
-                elif fid_keep is not None:
-                    if fid not in fid_keep:
-                        item["file_name_saved"] = "起始及之前"
-                        preview_list.append(item)
-                        continue
+            if _mark_if_before_start(item, file_name):
+                preview_list.append(item)
+                continue
 
             saved = mr.is_exists(file_name, dir_filename_list, ignore_ext) if dir_filename_list else None
             if saved:
@@ -1583,57 +1622,15 @@ def post_share_preview(payload: SharePreviewIn, db: Session = Depends(get_db)):
             preview_list.append(item)
             continue
 
-        if startfid:
-            if start_ts is not None:
-                if (_to_ts(updated_at) or 0) <= start_ts:
-                    item["file_name_saved"] = "起始及之前"
-                    preview_list.append(item)
-                    continue
-            elif fid_keep is not None:
-                if fid not in fid_keep:
-                    item["file_name_saved"] = "起始及之前"
-                    preview_list.append(item)
-                    continue
-
         search_re = compiled_subdir if (is_dir and compiled_subdir) else compiled_search
         matched = (not search_re) or bool(search_re.search(file_name))
         if matched:
             file_name_re = file_name
             if not is_dir:
-                if not disable_guessit_fallback and (not pattern.strip()) and (not replace.strip()) and bool(tmdb_series_title):
-                    try:
-                        from app.extensions.runtime.guessit_fallback import guessit_media_target
-
-                        file_name_re = (
-                            guessit_media_target(
-                                file_name,
-                                media_type=tmdb_media_type,
-                                tmdb_title=(str(tmdb_series_title) if tmdb_series_title else None),
-                                tmdb_year=tmdb_year,
-                                tv_seasons=tmdb_tv_seasons,
-                                tv_rename_template=tv_tpl or None,
-                                movie_rename_template=movie_tpl or None,
-                                trace_tag="preview",
-                            )
-                            or file_name
-                        )
-                    except Exception:
-                        file_name_re = file_name
-                else:
-                    try:
-                        file_name_re = mr.sub(pattern, replace, file_name)
-                    except re.error as e:
-                        detail = str(e)
-                        if "invalid group reference" in detail:
-                            raise bad_request(
-                                "TASK_REGEX_INVALID",
-                                "replace 规则不合法: 引用了不存在的捕获分组",
-                                detail=detail,
-                            ) from e
-                        raise bad_request(
-                            "TASK_REGEX_INVALID",
-                            f"replace 规则不合法: {detail}",
-                        ) from e
+                file_name_re = _preview_rename(file_name)
+                if _mark_if_before_start(item, file_name_re):
+                    preview_list.append(item)
+                    continue
             saved = mr.is_exists(file_name_re, dir_filename_list, ignore_ext and not is_dir) if dir_filename_list else None
             if saved:
                 item["file_name_saved"] = saved

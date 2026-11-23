@@ -593,8 +593,10 @@ function applyPromoteLocally(index: number) {
   const oldReason = mainLinkReason.value
   skipNextShareurlAutoLocate.value = true
   state.shareurl = row.url
-  // startfid 是旧主链接内的文件 fid，换主链接后已失效
-  state.startfid = ''
+  // 旧版 FID 锚点换链失效；集数锚点可保留
+  if (state.startfid && !isEpisodeAnchor(state.startfid)) {
+    state.startfid = ''
+  }
   mainLinkStatus.value = row.status
   mainLinkReason.value = row.reason || null
   const arr = [...backupLinks.value]
@@ -1037,7 +1039,10 @@ watch(() => state.shareurl, (newUrl, oldUrl) => {
           const resolved = getShareurl(url, { fid })
           if (resolved !== url) {
             state.shareurl = resolved
-            state.startfid = ''
+            // 旧版 FID 锚点随链接失效；集数锚点可跨目录保留
+            if (state.startfid && !isEpisodeAnchor(state.startfid)) {
+              state.startfid = ''
+            }
             // The watch will re-trigger, so return here
             previewHint.value = '已自动定位到实际文件夹'
             return
@@ -1295,7 +1300,29 @@ function clearTmdbSelection() {
   toast.success('已清除 TMDB 关联')
 }
 
-// ===== StartFID Picker =====
+// ===== Start episode (原 startfid) Picker =====
+/** 从重命名后的文件名提取集数锚点，如 S01E92 / E92 */
+function toEpisodeAnchor(name: string): string | null {
+  const text = String(name || '').trim()
+  if (!text) return null
+  const stem = text.replace(/\.[^.]+$/, '')
+  const se = stem.match(/[Ss](\d{1,2})\s*[.\-_ ]?\s*[Ee][Pp]?(\d{1,4})\b/)
+  if (se) return `S${se[1].padStart(2, '0')}E${se[2].padStart(2, '0')}`
+  const eOnly = stem.match(/(?:^|[^A-Za-z0-9])[Ee][Pp]?(\d{1,4})\b/)
+  if (eOnly) return `E${eOnly[1]}`
+  const bare = stem.match(/^(\d{1,4})$/)
+  if (bare) return `E${bare[1]}`
+  return null
+}
+
+function isEpisodeAnchor(value: string): boolean {
+  return Boolean(toEpisodeAnchor(value))
+}
+
+function renamedNameOf(item: SharePreviewItem): string {
+  return String(item.file_name_re || item.name_re || item.name || item.file_name || '').trim()
+}
+
 async function openStartfidPicker() {
   if (!state.shareurl.trim()) {
     toast.error('请先填写分享链接')
@@ -1306,13 +1333,27 @@ async function openStartfidPicker() {
   startfidError.value = ''
   startfidItems.value = []
   try {
+    // 带上 pattern/replace，以便预览重命名后的临时文件名再提取集数
     const data = await previewShare(buildPreviewParams({ max_items: 500, startfid: null }))
-    // Filter non-dir files and sort by date descending (newest first)
     const files = (data.items || []).filter((item) => !item.is_dir)
     files.sort((a, b) => {
-      const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0
-      const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0
-      return tb - ta
+      const na = renamedNameOf(a)
+      const nb = renamedNameOf(b)
+      const ka = toEpisodeAnchor(na)
+      const kb = toEpisodeAnchor(nb)
+      if (ka && kb) {
+        const ma = ka.match(/S(\d+)E(\d+)/i)
+        const mb = kb.match(/S(\d+)E(\d+)/i)
+        if (ma && mb) {
+          const sa = Number(ma[1]) * 10000 + Number(ma[2])
+          const sb = Number(mb[1]) * 10000 + Number(mb[2])
+          if (sa !== sb) return sa - sb
+        }
+        const ea = Number((ka.match(/(\d+)$/) || [])[1] || 0)
+        const eb = Number((kb.match(/(\d+)$/) || [])[1] || 0)
+        if (ea !== eb) return ea - eb
+      }
+      return na.localeCompare(nb, 'zh')
     })
     startfidItems.value = files
   } catch (e: any) {
@@ -1323,9 +1364,15 @@ async function openStartfidPicker() {
 }
 
 function selectStartfid(item: SharePreviewItem) {
-  state.startfid = item.fid
+  const renamed = renamedNameOf(item)
+  const anchor = toEpisodeAnchor(renamed)
+  if (!anchor) {
+    toast.error('无法从该文件的重命名结果识别集数，请检查匹配/替换规则后重试')
+    return
+  }
+  state.startfid = anchor
   showStartfidPicker.value = false
-  toast.success(`已选择起始文件: ${item.name}`)
+  toast.success(`已选择起始集数: ${anchor}（${renamed}）`)
 }
 
 // ===== Weekday =====
@@ -1527,8 +1574,10 @@ function onResourceAction(key: string, items: TaskSuggestionItem[]) {
     // 旧主链接降为备用（同盘时），避免直接丢弃已配置链接
     const oldMain = String(state.shareurl || '').trim()
     state.shareurl = url
-    // 换主链接后原链接内的起始文件已失效
-    state.startfid = ''
+    // 旧版 FID 锚点换链失效；集数锚点可保留
+    if (state.startfid && !isEpisodeAnchor(state.startfid)) {
+      state.startfid = ''
+    }
     mainLinkStatus.value = 'unknown'
     mainLinkReason.value = null
     if (oldMain && oldMain !== url && detectDriveTypeByUrl(oldMain) === detectDriveTypeByUrl(url)) {
@@ -1619,17 +1668,19 @@ function getTmdbPoster(item: TMDBBrief): string {
       <div class="absolute inset-0 bg-black/60" @click="showStartfidPicker = false" />
       <div class="modal-surface relative z-10 flex max-h-[70vh] w-[560px] flex-col overflow-hidden">
         <div class="modal-bar flex items-center justify-between border-b border-[hsl(var(--border))] px-5 py-3">
-          <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">选择起始文件</h3>
+          <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">选择起始集数</h3>
           <button class="icon-action" @click="showStartfidPicker = false">
             <X class="h-4 w-4 text-[hsl(var(--muted-foreground))]" />
           </button>
         </div>
         <div class="px-5 py-2 border-b border-[hsl(var(--border))]">
-          <p class="text-xs text-[hsl(var(--muted-foreground))]">选择一个文件作为转存起始点，排在此文件之前的文件将被跳过（按日期从新到旧排序）</p>
+          <p class="text-xs text-[hsl(var(--muted-foreground))]">
+            按匹配/替换规则生成临时文件名后提取集数（如 S01E92）。将转存该集及之后（集数 ≥ 起始值）的文件；换链后无需重设。
+          </p>
         </div>
         <!-- Table Header -->
-        <div class="grid grid-cols-[1fr_70px_110px] gap-2 px-5 py-2 border-b border-[hsl(var(--border))] text-xs font-medium text-[hsl(var(--muted-foreground))]">
-          <span>文件名</span><span>大小</span><span>日期</span>
+        <div class="grid grid-cols-[1fr_90px_70px] gap-2 px-5 py-2 border-b border-[hsl(var(--border))] text-xs font-medium text-[hsl(var(--muted-foreground))]">
+          <span>原名 → 重命名</span><span>集数</span><span>大小</span>
         </div>
         <div class="flex-1 overflow-y-auto px-5 py-3">
           <div v-if="startfidLoading" class="flex items-center justify-center py-8">
@@ -1641,16 +1692,18 @@ function getTmdbPoster(item: TMDBBrief): string {
             <div
               v-for="item in startfidItems"
               :key="item.fid"
-              class="grid grid-cols-[1fr_70px_110px] gap-2 items-center px-3 py-2 rounded cursor-pointer hover:bg-[hsl(var(--accent))] text-sm"
-              :class="state.startfid === item.fid ? 'bg-[hsl(var(--accent))] ring-1 ring-[hsl(var(--primary))]' : ''"
+              class="grid grid-cols-[1fr_90px_70px] gap-2 items-center px-3 py-2 rounded cursor-pointer hover:bg-[hsl(var(--accent))] text-sm"
+              :class="state.startfid === toEpisodeAnchor(renamedNameOf(item)) ? 'bg-[hsl(var(--accent))] ring-1 ring-[hsl(var(--primary))]' : ''"
               @click="selectStartfid(item)"
             >
-              <div class="flex items-center gap-2 min-w-0">
-                <FileText class="h-4 w-4 text-[hsl(var(--muted-foreground))] shrink-0" />
-                <span class="truncate text-[hsl(var(--foreground))]">{{ item.name }}</span>
+              <div class="min-w-0">
+                <div class="truncate text-[hsl(var(--foreground))]">{{ item.name }}</div>
+                <div v-if="renamedNameOf(item) && renamedNameOf(item) !== item.name" class="truncate text-xs text-green-600">
+                  → {{ renamedNameOf(item) }}
+                </div>
               </div>
+              <span class="text-xs font-medium text-[hsl(var(--foreground))]">{{ toEpisodeAnchor(renamedNameOf(item)) || '-' }}</span>
               <span class="text-[hsl(var(--muted-foreground))] text-xs">{{ item.size ? formatSize(item.size) : '-' }}</span>
-              <span class="text-[hsl(var(--muted-foreground))] text-xs">{{ formatTime(item.updated_at) }}</span>
             </div>
           </div>
         </div>
@@ -2234,16 +2287,19 @@ function getTmdbPoster(item: TMDBBrief): string {
                   />
                 </div>
 
-                <!-- 起始文件ID -->
+                <!-- 起始集数（兼容字段名 startfid） -->
                 <div>
-                  <label class="field-label">起始文件ID (startfid)</label>
+                  <label class="field-label">起始集数 (startfid)</label>
                   <div class="flex gap-2">
-                    <Input v-model="state.startfid" placeholder="从此fid开始转存" class="flex-1" />
+                    <Input v-model="state.startfid" placeholder="如 S01E92 / E92，转存该集及之后" class="flex-1" />
                     <Button variant="outline" size="sm" @click="openStartfidPicker" :disabled="!state.shareurl.trim()">
                       <FileText class="h-4 w-4 mr-1" />
                       选择
                     </Button>
                   </div>
+                  <p class="mt-1 text-[11px] text-[hsl(var(--muted-foreground))]">
+                    按重命名规则提取剧集号后过滤；换分享链接后仍有效，无需重选。
+                  </p>
                 </div>
 
                 <!-- 更新子目录 -->

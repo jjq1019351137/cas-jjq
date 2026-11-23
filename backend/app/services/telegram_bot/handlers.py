@@ -77,7 +77,7 @@ TASK_FIELDS: list[dict[str, Any]] = [
     {"key": "sync_task_uids", "label": "关联同步任务", "type": "list", "default": [], "display_key": "sync_task_names"},
     {"key": "enabled", "label": "启用任务", "type": "bool", "default": True, "editor": False},
     {"key": "ignore_extension", "label": "忽略扩展名", "type": "bool", "default": False},
-    {"key": "startfid", "label": "起始文件", "type": "str", "default": "", "display_key": "__startfid_label__"},
+    {"key": "startfid", "label": "起始集数", "type": "str", "default": "", "display_key": "__startfid_label__"},
 ]
 
 SYNC_FIELDS: list[dict[str, Any]] = [
@@ -94,6 +94,8 @@ SYNC_FIELDS: list[dict[str, Any]] = [
     {"key": "mode", "label": "同步模式", "type": "enum", "options": ["one_way", "two_way"], "default": "one_way"},
     {"key": "strategy.overwrite", "label": "允许覆盖", "type": "bool", "default": False},
     {"key": "strategy.one_way_delete_extras", "label": "单向删除多余文件", "type": "bool", "default": False},
+    {"key": "strategy.one_way_delete_extras_delay_minutes", "label": "删除延时(分钟)", "type": "int", "default": 0},
+    {"key": "strategy.unzip_zip_after_sync", "label": "同步ZIP后解压", "type": "bool", "default": True},
     {"key": "strategy.force_refresh", "label": "强制刷新目录", "type": "bool", "default": False},
     {"key": "strategy.concurrency", "label": "并发数", "type": "int", "default": 4},
     {"key": "strategy.request_interval_seconds", "label": "请求间隔秒数", "type": "float", "default": 0.0},
@@ -609,12 +611,20 @@ def _share_folder_label(shareurl: str, stack: list[dict[str, Any]] | None = None
 def _startfid_label_from_item(item: dict[str, Any] | None) -> str:
     payload = dict(item or {})
     name = str(payload.get("file_name") or payload.get("name") or "").strip()
-    fid = str(payload.get("fid") or "").strip()
-    if name and fid:
-        return f"{name} · {fid}"
-    if name:
-        return name
-    return fid or "-"
+    name_re = str(payload.get("file_name_re") or payload.get("name_re") or "").strip()
+    from app.services.start_episode_filter import episode_key_from_renamed_name, format_episode_anchor
+
+    key = episode_key_from_renamed_name(name_re or name)
+    if key is not None:
+        anchor = format_episode_anchor(key[0], key[1])
+        if name_re and name_re != name:
+            return f"{anchor} · {name_re}"
+        if name:
+            return f"{anchor} · {name}"
+        return anchor
+    if name_re and name:
+        return f"{name_re} · {name}"
+    return name_re or name or "-"
 
 
 def _tmdb_binding_label(draft: dict[str, Any]) -> str:
@@ -1547,14 +1557,16 @@ class TelegramBotHandler:
         else:
             files = sorted([x for x in items if not bool(x.get("is_dir"))], key=lambda x: str(x.get("updated_at") or ""), reverse=True)
             lines = [
-                "选择起始文件",
+                "选择起始集数",
                 f"目录: {current_folder_label}",
-                "点击文件后会写入 startfid。",
+                "点击文件后按重命名结果提取集数（如 S01E92）写入起始锚点。",
             ]
-            rows.append([button("🧹 清空起始文件", "brw", "start", "clear"), button("🔄 刷新", "brw", "start", "refresh")])
+            rows.append([button("🧹 清空起始集数", "brw", "start", "clear"), button("🔄 刷新", "brw", "start", "refresh")])
             for idx, item in enumerate(files):
                 file_name = str(item.get("file_name") or item.get("name") or "")
-                rows.append([button(f"[FILE] {file_name[:24]}", "brw", "start", "pick", idx)])
+                name_re = str(item.get("file_name_re") or item.get("name_re") or "").strip()
+                label = (name_re or file_name)[:24]
+                rows.append([button(f"[FILE] {label}", "brw", "start", "pick", idx)])
             preview_files = files[:12]
             if preview_files:
                 lines.append("")
@@ -2731,7 +2743,12 @@ class TelegramBotHandler:
                 if idx < 0 or idx >= len(files):
                     raise ValueError("文件不存在")
                 item = dict(files[idx] or {})
-                draft["startfid"] = str(item.get("fid") or "")
+                name = str(item.get("file_name") or item.get("name") or "").strip()
+                name_re = str(item.get("file_name_re") or item.get("name_re") or "").strip()
+                from app.services.start_episode_filter import episode_key_from_renamed_name, format_episode_anchor
+
+                key = episode_key_from_renamed_name(name_re or name)
+                draft["startfid"] = format_episode_anchor(key[0], key[1]) if key is not None else (name_re or name or str(item.get("fid") or ""))
                 draft["__startfid_label__"] = _startfid_label_from_item(item)
                 draft["shareurl"] = current_shareurl
                 draft["__share_folder_label__"] = _share_folder_label(current_shareurl, stack)
@@ -3237,9 +3254,13 @@ class TelegramBotHandler:
         _set_nested(draft, "shareurl", url)
         _set_nested(draft, "__main_link_status__", "ok" if activated else str(row.get("status") or "unknown"))
         _set_nested(draft, "__main_link_reason__", None if activated else (row.get("reason") or None))
-        # startfid 是旧主链接内的文件 fid，换主链接后已失效
-        _set_nested(draft, "startfid", "")
-        _set_nested(draft, "__startfid_label__", "-")
+        # 旧版 FID 锚点换主链接后失效；集数锚点可保留
+        from app.services.start_episode_filter import is_episode_anchor
+
+        current_start = str(_get_nested(draft, "startfid") or "").strip()
+        if current_start and not is_episode_anchor(current_start):
+            _set_nested(draft, "startfid", "")
+            _set_nested(draft, "__startfid_label__", "-")
         if old_main:
             backups.insert(0, _new_backup_link(old_main, status=old_status, reason=old_reason))
         _set_draft_backup_links(draft, backups)

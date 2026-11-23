@@ -144,11 +144,42 @@ class TaskSchedulerManager:
         if not bool(setting.enabled):
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
+        else:
+            try:
+                trigger = CronTrigger.from_crontab(str(setting.crontab), timezone=str(setting.timezone or "Asia/Shanghai"))
+                self.scheduler.add_job(
+                    run_drama_tasks,
+                    trigger=trigger,
+                    id=job_id,
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=60,
+                )
+            except Exception as e:
+                logger.error(f"任务调度 crontab 无效 job_id={job_id} crontab={getattr(setting, 'crontab', '')}: {e}")
+                if self.scheduler.get_job(job_id):
+                    self.scheduler.remove_job(job_id)
+
+        self._apply_openlist_cleanup_setting(setting)
+
+    def _apply_openlist_cleanup_setting(self, setting: Any) -> None:
+        if self.scheduler is None:
             return
+        job_id = "openlist_media_cleanup"
+        enabled = bool(getattr(setting, "openlist_cleanup_enabled", False))
+        path = str(getattr(setting, "openlist_cleanup_path", "") or "").strip()
+        if not enabled or not path:
+            if self.scheduler.get_job(job_id):
+                self.scheduler.remove_job(job_id)
+                logger.info("已移除 OpenList 媒体清理调度")
+            return
+        crontab = str(getattr(setting, "openlist_cleanup_crontab", "") or "").strip() or "0 3 * * *"
+        timezone = str(getattr(setting, "timezone", "") or "Asia/Shanghai")
         try:
-            trigger = CronTrigger.from_crontab(str(setting.crontab), timezone=str(setting.timezone or "Asia/Shanghai"))
+            trigger = CronTrigger.from_crontab(crontab, timezone=timezone)
             self.scheduler.add_job(
-                run_drama_tasks,
+                run_openlist_media_cleanup,
                 trigger=trigger,
                 id=job_id,
                 replace_existing=True,
@@ -157,10 +188,18 @@ class TaskSchedulerManager:
                 misfire_grace_time=60,
             )
         except Exception as e:
-            logger.error(f"任务调度 crontab 无效 job_id={job_id} crontab={getattr(setting, 'crontab', '')}: {e}")
+            logger.error("OpenList 清理调度 crontab 无效 job_id=%s crontab=%s: %s", job_id, crontab, e)
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
             return
+        job = self.scheduler.get_job(job_id)
+        logger.info(
+            "已加载 OpenList 媒体清理调度 path=%s crontab=%s timezone=%s next_run=%s",
+            path,
+            crontab,
+            timezone,
+            getattr(job, "next_run_time", None),
+        )
 
     def _apply_tmdb_cache_setting(self, setting: Any) -> None:
         if self.scheduler is None:
@@ -590,6 +629,33 @@ def run_drive_account_probe() -> None:
                     break
 
     logger.info("驱动账号自动探测完成 ok=%s skipped=%s failed=%s", ok, skipped, failed)
+
+
+def run_openlist_media_cleanup() -> None:
+    """定时清理 OpenList 指定目录下的 .mp4/.zip/.mkv。"""
+    from app.services.openlist_cleanup import cleanup_openlist_media_files
+
+    with SessionLocal() as db:
+        try:
+            setting = get_or_create_task_scheduler_setting(db)
+            db.commit()
+            if not bool(getattr(setting, "openlist_cleanup_enabled", False)):
+                return
+            path = str(getattr(setting, "openlist_cleanup_path", "") or "").strip()
+            if not path:
+                logger.info("OpenList 媒体清理跳过: 未配置路径")
+                return
+            result = cleanup_openlist_media_files(db, dir_path=path)
+            logger.info(
+                "OpenList 媒体清理完成 path=%s listed=%s matched=%s deleted=%s failed=%s",
+                result.get("path"),
+                result.get("listed"),
+                result.get("matched"),
+                result.get("deleted"),
+                result.get("failed"),
+            )
+        except Exception as e:
+            logger.exception("OpenList 媒体清理失败: %s", e)
 
 
 task_scheduler_manager = TaskSchedulerManager()
