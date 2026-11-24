@@ -1134,6 +1134,19 @@ def post_run_task_stream_by_payload(request: Request, payload: TaskCreateIn, cur
                     audit_ip=audit_ip,
                 )
                 if str(getattr(wtask, "task_type", "") or "") == "drama":
+                    # 与定时调度 /tasks/{id}/run 一致：手动「运行一次」也要推送追剧通知
+                    with SessionLocal() as ndb:
+                        try:
+                            section, should_notify = build_task_section(wtask, execution)
+                            if should_notify and section:
+                                send_runtime(ndb, DRAMA_NOTIFY_TITLE, section)
+                                ndb.commit()
+                        except Exception:
+                            ndb.rollback()
+                            logger.exception(
+                                "手动运行追剧通知失败 task_uid=%s",
+                                str(getattr(wtask, "task_uid", "") or "").strip(),
+                            )
                     if should_trigger_linked_sync_for_drama_execution(execution):
                         drama_uid = str(getattr(wtask, "task_uid", "") or "").strip()
                         account_name = str(getattr(wtask, "account_name", "") or "").strip() or str(

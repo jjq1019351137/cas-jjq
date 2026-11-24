@@ -25,7 +25,6 @@ from app.core.errors import ApiError, bad_request
 from app.db.session import SessionLocal
 from app.extensions.runtime.execution_log import ExecutionLog
 from app.extensions.runtime.plugin_hooks import PluginHookRunner
-from app.extensions.runtime.sync_executor_dl302 import Dl302SyncExecutor
 from app.extensions.runtime.sync_plugin_loader import sync_sync_plugin_definitions
 from app.extensions.runtime.sync_plugin_registry import SyncPluginRegistry
 from app.models.sync_execution import SyncExecution
@@ -370,7 +369,11 @@ class SyncExecutor:
         source = Endpoint(type=str(task.source_type or "").strip(), path=str(task.source_path or "").strip())
         target = Endpoint(type=str(task.target_type or "").strip(), path=str(task.target_path or "").strip())
         if "netdisk" in {source.type, target.type}:
-            return Dl302SyncExecutor(self.db).run_sync_task(task, log=log, strategy_override=strategy_override)
+            # 已移除 dl302：网盘直连同步不可用，请改用 OpenList / 本地
+            raise bad_request(
+                "SYNC_NETDISK_UNSUPPORTED",
+                "当前版本已移除 302/网盘直连同步引擎，请将源或目标改为 OpenList 或本地路径",
+            )
         mode = str(getattr(task, "mode", "") or "one_way").strip() or "one_way"
         if source.type == "openlist" or target.type == "openlist":
             self._get_openlist_client()

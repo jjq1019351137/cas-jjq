@@ -674,7 +674,9 @@ class TaskExecutor:
                         lambda db: get_tmdb_detail_cached(db, media_type=tmdb_media_type, tmdb_id=tmdb_id)
                     )
                     if configured and isinstance(detail, dict):
-                        task_data["tmdb_series_title"] = detail.get("name") if tmdb_media_type == "tv" else detail.get("title")
+                        title = detail.get("name") if tmdb_media_type == "tv" else detail.get("title")
+                        # 详情缺标题时用任务名兜底，保证纯数字文件名仍可走 guessit 智能重命名
+                        task_data["tmdb_series_title"] = str(title or "").strip() or str(task_data.get("taskname") or "").strip() or None
                         if tmdb_media_type == "tv":
                             raw_seasons = detail.get("seasons")
                             task_data["tmdb_tv_seasons"] = raw_seasons if isinstance(raw_seasons, list) else None
@@ -683,9 +685,10 @@ class TaskExecutor:
                             if len(rd) >= 4 and rd[:4].isdigit():
                                 task_data["tmdb_year"] = int(rd[:4])
                     else:
-                        task_data["tmdb_series_title"] = None
+                        # 已关联 TMDB 但详情不可用：仍用任务名启用智能重命名（避免 01.zip 只能靠自定义正则）
+                        task_data["tmdb_series_title"] = str(task_data.get("taskname") or "").strip() or None
                 except Exception:
-                    task_data["tmdb_series_title"] = None
+                    task_data["tmdb_series_title"] = str(task_data.get("taskname") or "").strip() or None
             else:
                 task_data["tmdb_series_title"] = None
         if init_account_for_task:

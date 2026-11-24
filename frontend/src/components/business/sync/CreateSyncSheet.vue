@@ -2,12 +2,11 @@
 import { ref, watch, computed, reactive } from 'vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { X, Folder, FolderOpen, Loader2, ArrowUp, RefreshCw, FileText } from 'lucide-vue-next'
+import { X, Folder, FolderOpen, Loader2, ArrowUp, RefreshCw, FileText, ArrowLeftRight } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { useCreateSyncTaskMutation, useUpdateSyncTaskMutation } from '@/hooks/mutations/sync'
-import { useDriveAccountsQuery } from '@/hooks/queries/extensions'
 import { useTasksQuery } from '@/hooks/queries/tasks'
-import { browseLocalSync, browseNetdiskSync } from '@/api/syncTasks'
+import { browseLocalSync } from '@/api/syncTasks'
 import { browseOpenList } from '@/api/openlist'
 import type { SyncTaskItem } from '@/types/syncTasks'
 import { extractErrorMessage } from '@/lib/driveAuth'
@@ -28,27 +27,21 @@ const emit = defineEmits<{
 const { toast } = useToast()
 const createMutation = useCreateSyncTaskMutation()
 const updateMutation = useUpdateSyncTaskMutation()
-const { data: accountsData } = useDriveAccountsQuery()
 const { data: dramaTasks } = useTasksQuery()
 
-const SUPPORTED_NETDISK_DRIVE_TYPES = ['115', 'cloud139', 'cloud189', 'uc', 'quark', 'guangya'] as const
-
-const availableAccounts = computed(() =>
-  (accountsData.value ?? [])
-    .filter((a) => a.enabled && (SUPPORTED_NETDISK_DRIVE_TYPES as readonly string[]).includes(a.drive_type))
-    .sort((a, b) => (a.is_default ? -1 : b.is_default ? 1 : a.name.localeCompare(b.name))),
-)
+type EndpointKind = 'local' | 'openlist'
 
 const isEditing = computed(() => !!props.editTask)
 const title = computed(() => (isEditing.value ? '编辑同步任务' : '新建同步任务'))
+const showAdvanced = ref(false)
 
-// Form state
+// Form state（已移除网盘直连，仅本地 / OpenList）
 const name = ref('')
 const enabled = ref(true)
-const sourceType = ref<'local' | 'netdisk' | 'openlist'>('local')
+const sourceType = ref<EndpointKind>('openlist')
 const sourceAccountId = ref<number | null>(null)
 const sourcePath = ref('/')
-const targetType = ref<'local' | 'netdisk' | 'openlist'>('netdisk')
+const targetType = ref<EndpointKind>('local')
 const targetAccountId = ref<number | null>(null)
 const targetPath = ref('/')
 const mode = ref<'one_way' | 'two_way'>('one_way')
@@ -64,20 +57,37 @@ const openlistCopyBatchSize = ref(200)
 const dramaTaskUids = ref<string[]>([])
 const DELETE_DELAY_OPTIONS = [0, 5, 10, 15, 20, 25, 30] as const
 
-const targetDriveType = computed(() => {
-  if (targetType.value !== 'netdisk' || targetAccountId.value == null) return ''
-  const acc = availableAccounts.value.find((a) => a.id === targetAccountId.value)
-  return acc?.drive_type ?? ''
-})
-const showAutoWash = computed(() => targetDriveType.value === 'cloud139')
+function endpointLabel(t: EndpointKind) {
+  return t === 'local' ? '本地' : 'OpenList'
+}
+
+const summaryText = computed(
+  () => `${endpointLabel(sourceType.value)} 到 ${endpointLabel(targetType.value)} 的${mode.value === 'one_way' ? '单向' : '双向'}同步`,
+)
+
+function swapSides() {
+  const st = sourceType.value
+  const sp = sourcePath.value
+  const sa = sourceAccountId.value
+  sourceType.value = targetType.value
+  sourcePath.value = targetPath.value
+  sourceAccountId.value = targetAccountId.value
+  targetType.value = st
+  targetPath.value = sp
+  targetAccountId.value = sa
+}
+
+function normalizeEndpointType(raw: string | undefined | null): EndpointKind {
+  return raw === 'openlist' ? 'openlist' : 'local'
+}
 
 function resetForm() {
   name.value = ''
   enabled.value = true
-  sourceType.value = 'local'
+  sourceType.value = 'openlist'
   sourceAccountId.value = null
   sourcePath.value = '/'
-  targetType.value = 'netdisk'
+  targetType.value = 'local'
   targetAccountId.value = null
   targetPath.value = '/'
   mode.value = 'one_way'
@@ -91,16 +101,17 @@ function resetForm() {
   requestIntervalSeconds.value = 0
   openlistCopyBatchSize.value = 200
   dramaTaskUids.value = []
+  showAdvanced.value = false
 }
 
 function fillFromTask(task: SyncTaskItem) {
   name.value = task.name
   enabled.value = task.enabled
-  sourceType.value = task.source.type
-  sourceAccountId.value = task.source.account_id ?? null
+  sourceType.value = normalizeEndpointType(task.source.type)
+  sourceAccountId.value = null
   sourcePath.value = task.source.path
-  targetType.value = task.target.type
-  targetAccountId.value = task.target.account_id ?? null
+  targetType.value = normalizeEndpointType(task.target.type)
+  targetAccountId.value = null
   targetPath.value = task.target.path
   mode.value = task.mode
   overwrite.value = task.strategy.overwrite
@@ -114,6 +125,7 @@ function fillFromTask(task: SyncTaskItem) {
   requestIntervalSeconds.value = task.strategy.request_interval_seconds
   openlistCopyBatchSize.value = task.strategy.openlist_copy_batch_size
   dramaTaskUids.value = [...(task.drama_task_uids ?? [])]
+  showAdvanced.value = false
 }
 
 watch(
@@ -136,12 +148,10 @@ function buildPayload() {
     source: {
       type: sourceType.value,
       path: sourcePath.value,
-      account_id: sourceType.value === 'netdisk' ? sourceAccountId.value : undefined,
     },
     target: {
       type: targetType.value,
       path: targetPath.value,
-      account_id: targetType.value === 'netdisk' ? targetAccountId.value : undefined,
     },
     mode: mode.value,
     strategy: {
@@ -208,7 +218,7 @@ const pathPicker = reactive({
   visible: false,
   loading: false,
   endpoint: '' as 'source' | 'target',
-  endpointType: '' as 'local' | 'netdisk' | 'openlist',
+  endpointType: 'local' as EndpointKind,
   accountName: '',
   currentPath: '/',
   paths: [] as Array<{ name: string; fid?: string; path?: string }>,
@@ -216,24 +226,11 @@ const pathPicker = reactive({
   error: '',
 })
 
-function getAccountName(accountId: number | null): string {
-  if (!accountId) return ''
-  const acc = availableAccounts.value.find((a) => a.id === accountId)
-  return acc?.name || ''
-}
-
 async function openPathPicker(endpoint: 'source' | 'target') {
   const type = endpoint === 'source' ? sourceType.value : targetType.value
-  const accountId = endpoint === 'source' ? sourceAccountId.value : targetAccountId.value
-
-  if (type === 'netdisk' && !accountId) {
-    toast.error('请先选择网盘账号')
-    return
-  }
-
   pathPicker.endpoint = endpoint
   pathPicker.endpointType = type
-  pathPicker.accountName = type === 'netdisk' ? getAccountName(accountId) : ''
+  pathPicker.accountName = ''
   pathPicker.currentPath = (endpoint === 'source' ? sourcePath.value : targetPath.value) || '/'
   pathPicker.visible = true
   pathPicker.error = ''
@@ -249,12 +246,7 @@ async function refreshPicker() {
       pathPicker.currentPath = res.dir_path || pathPicker.currentPath
       pathPicker.items = res.items || []
       pathPicker.paths = res.paths || []
-    } else if (pathPicker.endpointType === 'netdisk') {
-      const res = await browseNetdiskSync({ dir_path: pathPicker.currentPath, account_name: pathPicker.accountName, max_items: 500 })
-      pathPicker.currentPath = res.dir_path || pathPicker.currentPath
-      pathPicker.items = res.items || []
-      pathPicker.paths = res.paths || []
-    } else if (pathPicker.endpointType === 'openlist') {
+    } else {
       const res = await browseOpenList({ path: pathPicker.currentPath, max_items: 500 })
       pathPicker.currentPath = res.dir_path || pathPicker.currentPath
       pathPicker.items = res.items || []
@@ -328,7 +320,7 @@ function closePicker() {
           <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">
             浏览{{ pathPicker.endpoint === 'source' ? '源' : '目标' }}路径
             <span class="ml-2 text-xs font-normal text-[hsl(var(--muted-foreground))]">
-              ({{ pathPicker.endpointType === 'local' ? '本地' : pathPicker.endpointType === 'netdisk' ? '网盘' : 'OpenList' }})
+              ({{ pathPicker.endpointType === 'local' ? '本地' : 'OpenList' }})
             </span>
           </h3>
           <button class="rounded p-1 hover:bg-[hsl(var(--accent))]" @click="closePicker">
@@ -416,230 +408,167 @@ function closePicker() {
     </div>
   </Teleport>
 
-  <!-- ===== Main Sheet ===== -->
+  <!-- ===== Main Modal ===== -->
   <Teleport to="body">
-    <Transition name="sync-sheet">
-      <div v-if="open" class="fixed inset-0 z-50 flex justify-end">
-        <!-- Overlay -->
-        <div
-          class="absolute inset-0 bg-black/50 transition-opacity"
-          @click="handleOverlayClick"
-        />
-        <!-- Panel -->
-        <div
-          class="relative z-10 flex h-full w-[480px] max-w-[90vw] flex-col bg-[hsl(var(--card))] shadow-xl"
-        >
-          <!-- Header -->
-          <div class="flex items-center justify-between border-b border-[hsl(var(--border))] px-6 py-4">
-            <h2 class="text-lg font-semibold text-[hsl(var(--foreground))]">{{ title }}</h2>
-            <Button variant="ghost" size="icon" class="h-8 w-8" @click="emit('close')">
+    <Transition name="sync-modal">
+      <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-black/50" @click="handleOverlayClick" />
+        <div class="relative z-10 flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-2xl">
+          <div class="flex items-start justify-between gap-4 border-b border-[hsl(var(--border))] px-6 py-4">
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <h2 class="text-lg font-semibold text-[hsl(var(--foreground))]">{{ title }}</h2>
+                <span
+                  class="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                  :class="enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]'"
+                >{{ enabled ? '已启用' : '已停用' }}</span>
+              </div>
+              <p class="mt-1 text-xs text-[hsl(var(--muted-foreground))]">左右两侧分别配置源与目标，中间可以切换方向与同步模式。</p>
+            </div>
+            <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" @click="emit('close')">
               <X class="h-4 w-4" />
             </Button>
           </div>
 
-          <!-- Form -->
-          <div class="flex-1 overflow-y-auto px-6 py-4 space-y-6">
-            <!-- 基础信息 -->
-            <div class="space-y-4">
-              <h3 class="text-sm font-semibold text-[hsl(var(--foreground))] border-b border-[hsl(var(--border))] pb-2">基础信息</h3>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">任务名称</label>
-                <Input v-model="name" placeholder="输入任务名称" />
+          <div class="flex-1 space-y-5 overflow-y-auto bg-[hsl(var(--muted))]/20 px-6 py-5">
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-4">
+              <div class="flex flex-wrap items-end gap-3">
+                <div class="min-w-[220px] flex-1 space-y-1.5">
+                  <label class="text-sm font-medium text-[hsl(var(--foreground))]">任务名称</label>
+                  <Input v-model="name" placeholder="例如：电影库增量同步" />
+                </div>
+                <label class="mb-2 flex items-center gap-2 text-sm text-[hsl(var(--foreground))]">
+                  <input v-model="enabled" type="checkbox" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
+                  启用任务
+                </label>
+                <Button variant="outline" size="sm" class="mb-1.5" @click="showAdvanced = !showAdvanced">
+                  {{ showAdvanced ? '收起高级' : '高级配置' }}
+                </Button>
               </div>
+            </section>
 
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">源类型</label>
-                <select
-                  v-model="sourceType"
-                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
-                >
-                  <option value="local">本地路径</option>
-                  <option value="netdisk">网盘</option>
-                  <option value="openlist">OpenList</option>
-                </select>
-              </div>
-
-              <div v-if="sourceType === 'netdisk'" class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">源网盘账号</label>
-                <select
-                  v-model="sourceAccountId"
-                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
-                >
-                  <option :value="null">请选择账号</option>
-                  <option v-for="acc in availableAccounts" :key="acc.id" :value="acc.id">
-                    {{ acc.name }} ({{ acc.drive_type }})
-                  </option>
-                </select>
-              </div>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">源路径</label>
-                <div class="flex gap-2">
-                  <Input v-model="sourcePath" placeholder="输入源路径" class="flex-1" />
-                  <Button variant="outline" size="sm" @click="openPathPicker('source')">
-                    <FolderOpen class="h-4 w-4 mr-1" />
-                    浏览
-                  </Button>
+            <section class="space-y-3">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">同步方向</h3>
+                  <p class="text-xs text-[hsl(var(--muted-foreground))]">左右两侧分别配置源与目标，中间可切换方向。</p>
+                </div>
+                <div class="inline-flex rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-0.5">
+                  <button type="button" class="rounded-md px-3 py-1.5 text-xs font-medium" :class="mode === 'one_way' ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]' : 'text-[hsl(var(--muted-foreground))]'" @click="mode = 'one_way'">单向</button>
+                  <button type="button" class="rounded-md px-3 py-1.5 text-xs font-medium" :class="mode === 'two_way' ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]' : 'text-[hsl(var(--muted-foreground))]'" @click="mode = 'two_way'">双向</button>
                 </div>
               </div>
 
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">目标类型</label>
-                <select
-                  v-model="targetType"
-                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
-                >
-                  <option value="local">本地路径</option>
-                  <option value="netdisk">网盘</option>
-                  <option value="openlist">OpenList</option>
-                </select>
-              </div>
-
-              <div v-if="targetType === 'netdisk'" class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">目标网盘账号</label>
-                <select
-                  v-model="targetAccountId"
-                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
-                >
-                  <option :value="null">请选择账号</option>
-                  <option v-for="acc in availableAccounts" :key="acc.id" :value="acc.id">
-                    {{ acc.name }} ({{ acc.drive_type }})
-                  </option>
-                </select>
-              </div>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">目标路径</label>
-                <div class="flex gap-2">
-                  <Input v-model="targetPath" placeholder="输入目标路径" class="flex-1" />
-                  <Button variant="outline" size="sm" @click="openPathPicker('target')">
-                    <FolderOpen class="h-4 w-4 mr-1" />
-                    浏览
-                  </Button>
-                </div>
-              </div>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">同步模式</label>
-                <select
-                  v-model="mode"
-                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
-                >
-                  <option value="one_way">单向同步</option>
-                  <option value="two_way">双向同步</option>
-                </select>
-              </div>
-            </div>
-
-            <!-- 策略参数 -->
-            <div class="space-y-4">
-              <h3 class="text-sm font-semibold text-[hsl(var(--foreground))] border-b border-[hsl(var(--border))] pb-2">策略参数</h3>
-
-              <label class="flex items-center gap-3 cursor-pointer">
-                <input type="checkbox" v-model="overwrite" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
-                <span class="text-sm text-[hsl(var(--foreground))]">覆盖同名文件</span>
-              </label>
-
-              <label class="flex items-center gap-3 cursor-pointer">
-                <input type="checkbox" v-model="deleteExtras" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
-                <span class="text-sm text-[hsl(var(--foreground))]">删除多余文件（单向模式）</span>
-              </label>
-
-              <div v-if="deleteExtras && mode === 'one_way'" class="space-y-1.5 pl-7">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">删除延时</label>
-                <select
-                  v-model.number="deleteExtrasDelayMinutes"
-                  class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm text-[hsl(var(--foreground))]"
-                >
-                  <option v-for="m in DELETE_DELAY_OPTIONS" :key="m" :value="m">
-                    {{ m === 0 ? '立即删除（0 分钟）' : `${m} 分钟后删除` }}
-                  </option>
-                </select>
-                <p class="text-xs text-[hsl(var(--muted-foreground))]">同步复制完成后再等待指定时间删除目标侧多余文件；执行中可取消。</p>
-              </div>
-
-              <label class="flex items-center gap-3 cursor-pointer">
-                <input type="checkbox" v-model="unzipZipAfterSync" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
-                <span class="text-sm text-[hsl(var(--foreground))]">
-                  同步 ZIP 后自动解压
-                  <span class="block text-xs text-[hsl(var(--muted-foreground))]">解压到同目录，按 zip 文件名前缀重命名，并删除原 zip（local / OpenList）。</span>
-                </span>
-              </label>
-
-              <label class="flex items-center gap-3 cursor-pointer">
-                <input type="checkbox" v-model="forceRefresh" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
-                <span class="text-sm text-[hsl(var(--foreground))]">强制刷新</span>
-              </label>
-
-              <label v-if="showAutoWash" class="flex items-start gap-3 cursor-pointer">
-                <input type="checkbox" v-model="autoWash" class="h-4 w-4 mt-0.5 rounded border-[hsl(var(--border))]" />
-                <span class="text-sm text-[hsl(var(--foreground))]">
-                  自动洗码
-                  <span class="block text-xs text-[hsl(var(--muted-foreground))]">仅移动云盘目标生效：上传后检测到文件被和谐时，自动洗码并上传。</span>
-                </span>
-              </label>
-
-              <label class="flex items-center gap-3 cursor-pointer">
-                <input type="checkbox" v-model="enabled" class="h-4 w-4 rounded border-[hsl(var(--border))]" />
-                <span class="text-sm text-[hsl(var(--foreground))]">启用任务</span>
-              </label>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">并发数</label>
-                <Input v-model.number="concurrency" type="number" min="1" max="32" placeholder="4" />
-              </div>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">请求间隔（秒）</label>
-                <Input v-model.number="requestIntervalSeconds" type="number" min="0" max="5" step="0.1" placeholder="0" />
-              </div>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">批量复制大小</label>
-                <Input v-model.number="openlistCopyBatchSize" type="number" min="1" max="5000" placeholder="200" />
-              </div>
-            </div>
-
-            <!-- 高级选项 -->
-            <div class="space-y-4">
-              <h3 class="text-sm font-semibold text-[hsl(var(--foreground))] border-b border-[hsl(var(--border))] pb-2">高级选项</h3>
-
-              <div class="space-y-1.5">
-                <label class="text-sm font-medium text-[hsl(var(--foreground))]">关联追剧任务</label>
-                <div class="max-h-40 overflow-y-auto rounded-md border border-[hsl(var(--border))] p-2 space-y-1">
-                  <div v-if="!dramaTasks?.length" class="text-xs text-[hsl(var(--muted-foreground))] py-2 text-center">
-                    暂无追剧任务
+              <div class="grid grid-cols-1 items-stretch gap-3 md:grid-cols-[1fr_auto_1fr]">
+                <div class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-4">
+                  <div class="flex items-start justify-between gap-2">
+                    <div>
+                      <div class="text-sm font-semibold text-[hsl(var(--foreground))]">源配置</div>
+                      <div class="text-xs text-[hsl(var(--muted-foreground))]">同步读取的起点</div>
+                    </div>
+                    <span class="rounded-full bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-600">{{ endpointLabel(sourceType) }}</span>
                   </div>
-                  <label
-                    v-for="dt in dramaTasks"
-                    :key="dt.task_uid"
-                    class="flex items-center gap-2 rounded px-2 py-1 cursor-pointer hover:bg-[hsl(var(--muted))]"
-                  >
-                    <input
-                      type="checkbox"
-                      :checked="dramaTaskUids.includes(dt.task_uid)"
-                      class="h-3.5 w-3.5 rounded border-[hsl(var(--border))]"
-                      @change="toggleDramaTask(dt.task_uid)"
-                    />
-                    <span class="text-sm text-[hsl(var(--foreground))] truncate">{{ dt.taskname }}</span>
-                  </label>
+                  <div class="inline-flex rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 p-0.5">
+                    <button type="button" class="rounded-md px-3 py-1.5 text-xs font-medium" :class="sourceType === 'local' ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]' : 'text-[hsl(var(--muted-foreground))]'" @click="sourceType = 'local'">本地</button>
+                    <button type="button" class="rounded-md px-3 py-1.5 text-xs font-medium" :class="sourceType === 'openlist' ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]' : 'text-[hsl(var(--muted-foreground))]'" @click="sourceType = 'openlist'">OpenList</button>
+                  </div>
+                  <div class="space-y-1.5">
+                    <label class="text-sm font-medium text-[hsl(var(--foreground))]">源路径</label>
+                    <div class="flex gap-2">
+                      <Input v-model="sourcePath" placeholder="/" class="flex-1" />
+                      <Button variant="outline" size="sm" @click="openPathPicker('source')"><FolderOpen class="mr-1 h-4 w-4" />浏览</Button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="flex flex-col items-center justify-center gap-2 py-2">
+                  <div class="hidden h-10 w-px bg-[hsl(var(--border))] md:block" />
+                  <Button variant="outline" size="sm" class="gap-1" @click="swapSides">
+                    <ArrowLeftRight class="h-3.5 w-3.5" />切换方向
+                  </Button>
+                  <div class="hidden h-10 w-px bg-[hsl(var(--border))] md:block" />
+                </div>
+
+                <div class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-4">
+                  <div class="flex items-start justify-between gap-2">
+                    <div>
+                      <div class="text-sm font-semibold text-[hsl(var(--foreground))]">目标配置</div>
+                      <div class="text-xs text-[hsl(var(--muted-foreground))]">同步写入的位置</div>
+                    </div>
+                    <span class="rounded-full bg-violet-500/15 px-2 py-0.5 text-[11px] font-medium text-violet-600">{{ endpointLabel(targetType) }}</span>
+                  </div>
+                  <div class="inline-flex rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 p-0.5">
+                    <button type="button" class="rounded-md px-3 py-1.5 text-xs font-medium" :class="targetType === 'local' ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]' : 'text-[hsl(var(--muted-foreground))]'" @click="targetType = 'local'">本地</button>
+                    <button type="button" class="rounded-md px-3 py-1.5 text-xs font-medium" :class="targetType === 'openlist' ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]' : 'text-[hsl(var(--muted-foreground))]'" @click="targetType = 'openlist'">OpenList</button>
+                  </div>
+                  <div class="space-y-1.5">
+                    <label class="text-sm font-medium text-[hsl(var(--foreground))]">目标路径</label>
+                    <div class="flex gap-2">
+                      <Input v-model="targetPath" placeholder="/" class="flex-1" />
+                      <Button variant="outline" size="sm" @click="openPathPicker('target')"><FolderOpen class="mr-1 h-4 w-4" />浏览</Button>
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
+            </section>
+
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-4">
+              <div>
+                <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">同步策略</h3>
+                <p class="text-xs text-[hsl(var(--muted-foreground))]">常用选项放前面，高级参数收在下方。</p>
+              </div>
+              <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-3">
+                  <input v-model="overwrite" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-[hsl(var(--border))]" />
+                  <span class="text-sm text-[hsl(var(--foreground))]"><span class="font-medium">覆盖同名文件</span><span class="mt-0.5 block text-xs text-[hsl(var(--muted-foreground))]">目标已存在同名文件时允许覆盖。</span></span>
+                </label>
+                <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-3">
+                  <input v-model="deleteExtras" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-[hsl(var(--border))]" />
+                  <span class="text-sm text-[hsl(var(--foreground))]"><span class="font-medium">删除多余文件</span><span class="mt-0.5 block text-xs text-[hsl(var(--muted-foreground))]">单向模式下清理目标侧源中不存在的文件。</span></span>
+                </label>
+                <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-3">
+                  <input v-model="forceRefresh" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-[hsl(var(--border))]" />
+                  <span class="text-sm text-[hsl(var(--foreground))]"><span class="font-medium">强制刷新</span><span class="mt-0.5 block text-xs text-[hsl(var(--muted-foreground))]">忽略目录缓存，重新拉取源/目标列表。</span></span>
+                </label>
+                <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-3">
+                  <input v-model="unzipZipAfterSync" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-[hsl(var(--border))]" />
+                  <span class="text-sm text-[hsl(var(--foreground))]"><span class="font-medium">同步 ZIP 后解压</span><span class="mt-0.5 block text-xs text-[hsl(var(--muted-foreground))]">解压到同目录并按前缀重命名，删除原 zip。</span></span>
+                </label>
+              </div>
+              <div v-if="deleteExtras && mode === 'one_way'" class="max-w-xs space-y-1.5">
+                <label class="text-sm font-medium text-[hsl(var(--foreground))]">删除延时</label>
+                <select v-model.number="deleteExtrasDelayMinutes" class="flex h-10 w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm">
+                  <option v-for="m in DELETE_DELAY_OPTIONS" :key="m" :value="m">{{ m === 0 ? '立即删除（0 分钟）' : `${m} 分钟后删除` }}</option>
+                </select>
+              </div>
+              <div v-if="showAdvanced" class="grid gap-3 border-t border-[hsl(var(--border))] pt-3 sm:grid-cols-3">
+                <div class="space-y-1"><label class="text-xs text-[hsl(var(--muted-foreground))]">并发数</label><Input v-model.number="concurrency" type="number" min="1" max="32" /></div>
+                <div class="space-y-1"><label class="text-xs text-[hsl(var(--muted-foreground))]">请求间隔（秒）</label><Input v-model.number="requestIntervalSeconds" type="number" min="0" max="5" step="0.1" /></div>
+                <div class="space-y-1"><label class="text-xs text-[hsl(var(--muted-foreground))]">OpenList 批量复制大小</label><Input v-model.number="openlistCopyBatchSize" type="number" min="1" max="5000" /></div>
+              </div>
+            </section>
+
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-4">
+              <div>
+                <h3 class="text-sm font-semibold text-[hsl(var(--foreground))]">关联追剧任务</h3>
+                <p class="text-xs text-[hsl(var(--muted-foreground))]">勾选后，对应追剧任务完成时可联动触发本同步。</p>
+              </div>
+              <div class="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-2">
+                <div v-if="!dramaTasks?.length" class="py-6 text-center text-xs text-[hsl(var(--muted-foreground))]">暂无追剧任务</div>
+                <label v-for="dt in dramaTasks" :key="dt.task_uid" class="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-[hsl(var(--muted))]">
+                  <input type="checkbox" :checked="dramaTaskUids.includes(dt.task_uid)" class="h-3.5 w-3.5 rounded" @change="toggleDramaTask(dt.task_uid)" />
+                  <span class="truncate text-sm">{{ dt.taskname }}</span>
+                </label>
+              </div>
+            </section>
           </div>
 
-          <!-- Footer -->
-          <div class="border-t border-[hsl(var(--border))] px-6 py-4 flex gap-3">
-            <Button variant="outline" class="flex-1" @click="emit('close')">取消</Button>
-            <Button
-              variant="default"
-              class="flex-1"
-              :disabled="!name.trim() || isPending"
-              @click="handleSubmit"
-            >
-              {{ isPending ? '保存中...' : isEditing ? '保存修改' : '创建任务' }}
-            </Button>
+          <div class="flex flex-wrap items-center justify-between gap-3 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))] px-6 py-4">
+            <div class="text-sm text-[hsl(var(--muted-foreground))]">{{ summaryText }}</div>
+            <div class="flex gap-2">
+              <Button variant="outline" @click="emit('close')">取消</Button>
+              <Button :disabled="!name.trim() || isPending" @click="handleSubmit">{{ isPending ? '保存中...' : isEditing ? '保存修改' : '创建任务' }}</Button>
+            </div>
           </div>
         </div>
       </div>
@@ -648,20 +577,21 @@ function closePicker() {
 </template>
 
 <style scoped>
-.sync-sheet-enter-active,
-.sync-sheet-leave-active {
+.sync-modal-enter-active,
+.sync-modal-leave-active {
   transition: opacity 0.2s ease;
 }
-.sync-sheet-enter-active > div:last-child,
-.sync-sheet-leave-active > div:last-child {
-  transition: transform 0.2s ease;
+.sync-modal-enter-active > div:last-child,
+.sync-modal-leave-active > div:last-child {
+  transition: transform 0.2s ease, opacity 0.2s ease;
 }
-.sync-sheet-enter-from,
-.sync-sheet-leave-to {
+.sync-modal-enter-from,
+.sync-modal-leave-to {
   opacity: 0;
 }
-.sync-sheet-enter-from > div:last-child,
-.sync-sheet-leave-to > div:last-child {
-  transform: translateX(100%);
+.sync-modal-enter-from > div:last-child,
+.sync-modal-leave-to > div:last-child {
+  transform: translateY(12px) scale(0.98);
+  opacity: 0;
 }
 </style>

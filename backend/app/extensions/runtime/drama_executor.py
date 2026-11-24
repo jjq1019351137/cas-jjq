@@ -1022,24 +1022,7 @@ class DramaTaskExecutor:
 
     def _rename_by_fids(self, *, saved_fids: list[str], plan: list[DramaPlanItem], dest_root_fid: str) -> None:
         dest_root_fid = str(dest_root_fid or "").strip()
-        attempted: list[tuple[str, str, str]] = []
-        failed: set[str] = set()
-
-        limit = min(len(saved_fids), len(plan))
-        for i in range(limit):
-            fid = str(saved_fids[i] or "").strip()
-            if not fid:
-                continue
-            origin = str(plan[i].origin_name or "")
-            target = str(plan[i].target_name or "")
-            if not origin or not target or origin == target:
-                continue
-            attempted.append((fid, origin, target))
-            self._line(f"重命名：{origin} → {target}")
-            if not self._rename_one(fid=fid, origin=origin, target=target):
-                failed.add(fid)
-
-        if not attempted or not dest_root_fid:
+        if not dest_root_fid:
             return
 
         def _snapshot_dest() -> tuple[dict[str, str], dict[str, str]]:
@@ -1060,25 +1043,61 @@ class DramaTaskExecutor:
             return by_fid, by_name
 
         def _is_renamed(fid: str, origin: str, target: str, by_fid: dict[str, str], by_name: dict[str, str]) -> bool:
+            # 必须以目录实名为准：目标名存在，且源名已不在目录中（或该 fid 已是目标名）
             if by_fid.get(fid) == target:
-                return True
-            if fid not in by_fid and target in by_name and origin not in by_name:
+                return origin not in by_name or origin == target
+            if target in by_name and origin not in by_name:
                 return True
             return False
 
-        fid_name: dict[str, str] = {}
-        name_fid: dict[str, str] = {}
+        # 转存后稍等再列目录，按「原文件名」对齐 fid，避免 save_as_top_fids 顺序/缓存导致改错文件
+        import time as _time
+
+        _time.sleep(0.4)
+        try:
+            fid_name, name_fid = _snapshot_dest()
+        except Exception as exc:
+            self._line(f"INFO: 重命名前无法读取目标目录 err={str(exc).strip() or type(exc).__name__}")
+            fid_name, name_fid = {}, {}
+
+        attempted: list[tuple[str, str, str]] = []
+        limit = min(len(saved_fids), len(plan))
+        for i in range(limit):
+            origin = str(plan[i].origin_name or "")
+            target = str(plan[i].target_name or "")
+            if not origin or not target or origin == target:
+                continue
+            # 优先用目录里仍叫 origin 的 fid；其次才用转存返回的 fid
+            fid = str(name_fid.get(origin) or saved_fids[i] or "").strip()
+            if not fid:
+                self._line(f"WARN: 找不到待重命名文件 {origin}，跳过")
+                continue
+            # 目标名已存在且源名不在：视为已完成（可能网盘侧自动处理过）
+            if target in name_fid and origin not in name_fid:
+                self._line(f"跳过重命名：目录已是目标名 {target}")
+                attempted.append((fid, origin, target))
+                continue
+            attempted.append((fid, origin, target))
+            self._line(f"重命名：{origin} → {target}")
+            self._rename_one(fid=fid, origin=origin, target=target)
+
+        if not attempted:
+            return
+
+        _time.sleep(0.3)
         try:
             fid_name, name_fid = _snapshot_dest()
         except Exception as exc:
             self._line(f"INFO: 重命名校验失败，无法读取目标目录 err={str(exc).strip() or type(exc).__name__}")
-            fid_name = {}
-            name_fid = {}
+            fid_name, name_fid = {}, {}
 
         need_retry: list[tuple[str, str, str]] = []
         for fid, origin, target in attempted:
+            actual = fid_name.get(fid) or ("已是目标名" if target in name_fid and origin not in name_fid else "未找到")
             if _is_renamed(fid, origin, target, fid_name, name_fid):
+                self._line(f"校验通过：{origin} → {target}（目录实名={actual if actual != '已是目标名' else target}）")
                 continue
+            self._line(f"校验未通过：{origin} → {target}（目录实名={actual}）")
             need_retry.append((fid, origin, target))
 
         retry_success = 0
@@ -1087,28 +1106,32 @@ class DramaTaskExecutor:
             self._line(f"二次校验：待重试 {len(need_retry)}/{len(attempted)}")
             for fid, origin, target in need_retry:
                 self._line(f"重试重命名：{origin} → {target}")
-                # 优先用当前目录中按原始名查到的 fid（path 型 fid 重命名失败后仍有效）
                 retry_fid = name_fid.get(origin) or fid
                 if self._rename_one(fid=retry_fid, origin=origin, target=target):
                     retry_success += 1
                 else:
                     retry_failed += 1
+            _time.sleep(0.3)
+            try:
+                fid_name, name_fid = _snapshot_dest()
+            except Exception:
+                pass
 
         final_ok = 0
         final_failed = 0
-        try:
-            fid_name, name_fid = _snapshot_dest()
-            for fid, origin, target in attempted:
-                if _is_renamed(fid, origin, target, fid_name, name_fid):
-                    final_ok += 1
-                else:
-                    final_failed += 1
-        except Exception:
-            final_ok = len(attempted) - len(failed)
-            final_failed = len(failed)
+        for fid, origin, target in attempted:
+            if _is_renamed(fid, origin, target, fid_name, name_fid):
+                final_ok += 1
+            else:
+                final_failed += 1
+                still = fid_name.get(fid) or (origin if origin in name_fid else "?")
+                self._line(f"FAIL: 重命名最终未生效 {origin} → {target}（目录仍为 {still}）")
 
         self._line(
-            f"重命名摘要: total={len(attempted)} ok={final_ok} failed={final_failed} retry_ok={retry_success} retry_failed={retry_failed}"
+            f"重命名摘要: 成功 {final_ok}/{len(attempted)}"
+            + (f"，失败 {final_failed}" if final_failed else "")
+            + (f"，重试成功 {retry_success}" if retry_success else "")
+            + (f"，重试失败 {retry_failed}" if retry_failed else "")
         )
 
 

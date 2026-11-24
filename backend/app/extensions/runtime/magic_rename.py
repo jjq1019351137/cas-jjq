@@ -10,9 +10,11 @@ from natsort import natsorted
 
 class MagicRename:
     magic_regex: dict[str, dict[str, str]] = {
+        # 用魔法变量而不是 \1E\2：纯数字文件名（01.zip）时可选季号分组为空，
+        # 旧版 \1E\2.\3 会得到 E01.zip（缺 S01）；现统一带任务名：一念永恒.S01E01.zip
         "$TV_REGEX": {
             "pattern": r".*?([Ss]\d{1,2})?(?:[第EePpXx\.\-\_\( ]{1,2}|^)(\d{1,3})(?!\d).*?\.(mp4|mkv|mov|m4v|avi|mpeg|ts|zip|cas|iso)",
-            "replace": r"\1E\2.\3",
+            "replace": r"{TASKNAME}.{SXX}E{E}.{EXT}",
         },
         "$BLACK_WORD": {
             "pattern": r"^(?!.*纯享)(?!.*加更)(?!.*超前企划)(?!.*训练室)(?!.*蒸蒸日上).*",
@@ -167,6 +169,18 @@ class MagicRename:
                     if key == "{DATE}":
                         digits = "".join([c for c in value if c.isdigit()])
                         value = str(datetime.now().year)[: (8 - len(digits))] + digits
+                    elif key == "{E}":
+                        digits = "".join(c for c in value if c.isdigit())
+                        if digits.isdigit():
+                            # 集数至少两位：5 → 05，保持 105 不变
+                            value = digits.zfill(2)
+                    elif key == "{SXX}":
+                        # 统一成 S01 形式
+                        digits = "".join(c for c in value if c.isdigit())
+                        if digits.isdigit():
+                            value = f"S{int(digits):02d}"
+                        elif not value.upper().startswith("S"):
+                            value = f"S{value}" if value else "S01"
                     replace = replace.replace(key, value)
                     matched = True
                     break
@@ -176,8 +190,31 @@ class MagicRename:
             replace = replace.replace(key, "")
 
         if compiled_pattern is not None:
-            return compiled_pattern.sub(replace, file_name)
-        return replace
+            try:
+                result = compiled_pattern.sub(replace, file_name)
+            except re.error:
+                # replace 含非法分组引用等：保持原名，避免整次追剧任务中断
+                return file_name
+            return self._normalize_episode_filename(result, original=file_name)
+        return self._normalize_episode_filename(replace, original=file_name)
+
+    # 旧规则产物：E01.zip / E12.mp4（缺 Sxx）
+    _BARE_EPISODE_NAME = re.compile(r"^E(\d{1,4})(\.[A-Za-z0-9]+)$", re.IGNORECASE)
+    # S1E5 / S01E5 → 补齐季/集位数
+    _SXX_EXX_NAME = re.compile(r"(^|.*?\.)([Ss])(\d{1,2})([Ee])(\d{1,4})(\.[A-Za-z0-9]+)?$")
+
+    def _normalize_episode_filename(self, name: str, *, original: str) -> str:
+        result = str(name or "")
+        if not result or result == original:
+            return result
+        bare = self._BARE_EPISODE_NAME.fullmatch(result)
+        if bare:
+            result = f"S01E{int(bare.group(1)):02d}{bare.group(2)}"
+        m = self._SXX_EXX_NAME.fullmatch(result)
+        if m:
+            prefix, s_lit, season, e_lit, episode, ext = m.groups()
+            result = f"{prefix}{s_lit.upper()}{int(season):02d}{e_lit.upper()}{int(episode):02d}{ext or ''}"
+        return result
 
     def sub(self, pattern: str, replace: str, file_name: str) -> str:
         if not pattern and replace == "":

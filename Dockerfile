@@ -14,14 +14,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 RUN apk add --no-cache build-base libffi-dev openssl-dev
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt \
+    && pip uninstall -y pip \
+    && find /usr/local -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
 COPY backend/ /app/backend/
 
-# ---------- runtime (nginx + uvicorn + CAS/dl302) ----------
-# 精简：去掉 mkvtoolnix / exiftool / MySQL 迁移 / nginx headers-more；
-# 保留 dl302 二进制（网盘同步 CAS 复制依赖它；302 代理 UI/nginx /dl 已移除）
+# ---------- runtime (nginx + uvicorn；已去掉 dl302) ----------
 FROM python:3.13-alpine
-ARG TARGETARCH
 ARG BUILD_SHA
 ARG BUILD_TAG
 ENV BUILD_SHA=$BUILD_SHA \
@@ -39,16 +38,6 @@ RUN apk add --no-cache nginx supervisor tzdata ca-certificates libffi openssl \
 COPY --from=backend-builder /usr/local /usr/local
 COPY --from=backend-builder /app/backend /app/backend
 COPY --from=frontend-builder /fe/dist /usr/share/nginx/html
-COPY dl302-master-linux-amd64 /tmp/dl302-linux-amd64
-COPY dl302-master-linux-arm64 /tmp/dl302-linux-arm64
-RUN case "$TARGETARCH" in \
-      amd64) cp /tmp/dl302-linux-amd64 /app/dl302 ;; \
-      arm64) cp /tmp/dl302-linux-arm64 /app/dl302 ;; \
-      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
-    esac \
-    && chmod +x /app/dl302 \
-    && rm -f /tmp/dl302-linux-amd64 /tmp/dl302-linux-arm64
-
 COPY default /etc/nginx/http.d/default.conf
 
 RUN printf '%s\n' \
@@ -65,15 +54,6 @@ RUN printf '%s\n' \
     '[program:uvicorn]' \
     'directory=/app/backend' \
     'command=python -m uvicorn app.main:app --host 0.0.0.0 --port 8000' \
-    'autostart=true' \
-    'autorestart=true' \
-    'stdout_logfile=/dev/fd/1' \
-    'stdout_logfile_maxbytes=0' \
-    'stderr_logfile=/dev/fd/2' \
-    'stderr_logfile_maxbytes=0' \
-    '' \
-    '[program:dl302]' \
-    'command=/app/dl302' \
     'autostart=true' \
     'autorestart=true' \
     'stdout_logfile=/dev/fd/1' \

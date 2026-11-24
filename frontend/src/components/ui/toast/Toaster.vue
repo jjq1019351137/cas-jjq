@@ -19,7 +19,7 @@ const { toasts, dismiss } = useToast()
       @update:open="(val: boolean) => { if (!val) dismiss(item.id) }"
     />
     <ToastViewport
-      class="fixed bottom-0 right-0 z-[100] flex max-h-screen w-full flex-col-reverse gap-2 p-4 sm:max-w-[420px]"
+      class="fixed top-0 right-0 z-[100] flex max-h-screen w-full flex-col gap-2 p-4 sm:max-w-[420px]"
     />
   </ToastProvider>
 </template>

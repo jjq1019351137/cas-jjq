@@ -3,8 +3,8 @@ import { ref, reactive, computed, watch, nextTick } from 'vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
-  X, Eye, Loader2, ChevronDown, ChevronUp, Folder, FolderOpen, Search,
-  Play, ArrowUp, ArrowDown, FileText, ChevronRight, GripVertical, BookOpen, Check,
+  X, Eye, Loader2, Folder, FolderOpen, Search,
+  Play, ArrowUp, ArrowDown, FileText, GripVertical, BookOpen, Check,
 } from 'lucide-vue-next'
 import { previewShare, previewShareBatch, browseDrive, fetchTasks } from '@/api/tasks'
 import type { TaskSuggestionItem } from '@/types/resourceSearch'
@@ -107,7 +107,6 @@ const startfidLoading = ref(false)
 const startfidError = ref('')
 
 // UI state
-const advancedOpen = ref(false)
 const submitting = ref(false)
 
 // Auto-preview state
@@ -139,7 +138,6 @@ const backupLinks = ref<BackupLinkRow[]>([])
 /** 链接列表上限（与后端 MAX_SHARE_LINKS 一致）：主链接 + 备用链接合计 */
 const MAX_SHARE_LINKS = 10
 const MAX_BACKUP_LINKS = MAX_SHARE_LINKS - 1
-const backupOpen = ref(false)
 const backupInput = ref('')
 const backupChecking = ref(false)
 const backupEditSnapshot = ref('')
@@ -175,12 +173,6 @@ const resourceSearchActions = computed(() => {
   return RESOURCE_ACTIONS_REPLACE
 })
 
-// Plugin expand state
-const expandedPlugins = ref(new Set<string>())
-function togglePluginExpand(key: string) {
-  if (expandedPlugins.value.has(key)) expandedPlugins.value.delete(key)
-  else expandedPlugins.value.add(key)
-}
 function isPluginEnabled(key: string): boolean {
   return key in state.addition
 }
@@ -199,15 +191,17 @@ function togglePluginEnabled(key: string, event: Event) {
   }
 }
 
-// Builtin rename rules —— 从后端 /tasks/magic-regex 拉取「生效值」，
-// 这样在「设置 → 重命名规则」里对内置规则的覆盖能被追剧任务正确引用，而非写死的默认值。
+// Builtin rename rules —— 从后端 /tasks/magic-regex 拉取。
+// 选择内置/魔法规则时写入 key（如 $TV_REGEX），replace 留空，运行时走最新生效规则；
+// 避免把旧版展开式 \1E\2.\3 固化进任务（纯数字文件名会得到 E01.zip）。
 const builtinRules = computed(() => {
   const fetched = (magicRegexData.value?.rules || []).map((r) => ({
+    key: r.key || '',
     label: r.label ? `${r.label}（${r.key}）` : r.key,
     pattern: r.pattern || '',
     replace: r.replace || '',
   }))
-  return [{ label: '自定义 / 不使用', pattern: '', replace: '' }, ...fetched]
+  return [{ key: '', label: '自定义 / 不使用', pattern: '', replace: '' }, ...fetched]
 })
 // 依据当前 pattern/replace 反查命中的内置规则，便于编辑已有任务时回显选择
 const selectedRuleIdx = computed(() => {
@@ -215,6 +209,12 @@ const selectedRuleIdx = computed(() => {
   const p = state.pattern || ''
   const r = state.replace || ''
   if (!p && !r) return 0
+  // 已存魔法 key（replace 通常为空）
+  if (p.startsWith('$')) {
+    const byKey = rules.findIndex((rule, i) => i > 0 && rule.key === p)
+    if (byKey >= 0) return byKey
+  }
+  // 兼容历史任务：展开后的 pattern/replace
   const idx = rules.findIndex((rule, i) => i > 0 && rule.pattern === p && rule.replace === r)
   return idx >= 0 ? idx : 0
 })
@@ -222,10 +222,20 @@ const selectedRuleIdx = computed(() => {
 function applyBuiltinRule(event: Event) {
   const idx = Number((event.target as HTMLSelectElement).value)
   const rules = builtinRules.value
-  if (idx >= 0 && idx < rules.length) {
-    state.pattern = rules[idx].pattern
-    state.replace = rules[idx].replace
+  if (idx < 0 || idx >= rules.length) return
+  if (idx === 0) {
+    state.pattern = ''
+    state.replace = ''
+    return
   }
+  const rule = rules[idx]
+  if (rule.key) {
+    state.pattern = rule.key
+    state.replace = ''
+    return
+  }
+  state.pattern = rule.pattern
+  state.replace = rule.replace
 }
 
 // Weekday options
@@ -377,9 +387,7 @@ function resetForm() {
   state.update_subdir = ''
   state.update_subdir_resave_mode = 'none'
   state.addition = {}
-  advancedOpen.value = false
   backupLinks.value = []
-  backupOpen.value = false
   backupInput.value = ''
   mainLinkStatus.value = 'unknown'
   mainLinkReason.value = null
@@ -396,7 +404,6 @@ function initShareLinksFromTask(links: TaskShareUrlItem[] | undefined | null, ac
   backupLinks.value = list
     .filter((x) => x.url && x.url !== active)
     .map((x) => ({ url: x.url, status: x.status || 'unknown', reason: x.reason || null, last_checked_at: x.last_checked_at || null }))
-  backupOpen.value = backupLinks.value.length > 0
 }
 
 /** 当前已占用的链接集合（主链接 + 备用） */
@@ -450,7 +457,6 @@ function appendBackupLinks(urls: string[]): number {
   if (skippedDrive) toast.error(`已跳过 ${skippedDrive} 个不同网盘类型的链接`)
   if (skippedLimit) toast.error(`备用链接最多 ${MAX_BACKUP_LINKS} 个，已跳过 ${skippedLimit} 个`)
   if (added) {
-    backupOpen.value = true
     toast.success(`已添加 ${added} 个备用链接`)
     // 与主链接一致：新增后自动定位到实际文件夹
     for (const row of addedRows) locateBackupLink(row).catch(() => {})
@@ -1765,26 +1771,36 @@ function getTmdbPoster(item: TMDBBrief): string {
     </div>
   </Teleport>
 
-  <!-- ===== Main Sheet ===== -->
+  <!-- ===== Main Modal ===== -->
   <Teleport to="body">
-    <Transition name="sheet-right">
-      <div v-if="props.open" class="fixed inset-0 z-50 flex justify-end">
+    <Transition name="task-modal">
+      <div v-if="props.open" class="fixed inset-0 z-50 flex items-center justify-center p-4">
         <!-- Overlay -->
         <div class="absolute inset-0 bg-black/50 transition-opacity" @click="resetAndClose" />
         <!-- Panel -->
-        <div class="relative z-10 flex h-full w-full max-w-lg flex-col border-l border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-2xl">
+        <div class="relative z-10 flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] shadow-2xl">
           <!-- Header -->
-          <div class="modal-bar flex items-center justify-between border-b border-[hsl(var(--border))] px-6 py-4">
-            <h2 class="text-lg font-semibold tracking-tight text-[hsl(var(--foreground))]">{{ title }}</h2>
-            <button class="icon-action" @click="resetAndClose">
+          <div class="modal-bar flex items-start justify-between gap-4 border-b border-[hsl(var(--border))] px-5 py-3">
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <h2 class="text-lg font-semibold tracking-tight text-[hsl(var(--foreground))]">{{ title }}</h2>
+                <span
+                  class="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                  :class="state.enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]'"
+                >{{ state.enabled ? '已启用' : '已停用' }}</span>
+              </div>
+              <p class="mt-0.5 text-xs text-[hsl(var(--muted-foreground))]">左右并联配置；高级选项在下方平铺展开。</p>
+            </div>
+            <button class="icon-action shrink-0" @click="resetAndClose">
               <X class="h-5 w-5" />
             </button>
           </div>
 
-          <!-- Scrollable Form -->
-          <div class="flex-1 overflow-y-auto px-6 py-5 space-y-6">
+          <!-- Scrollable Form：并联布局，压缩纵向滚动 -->
+          <div class="flex-1 space-y-3 overflow-y-auto bg-[hsl(var(--muted))]/15 px-5 py-3">
+            <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
             <!-- ===== 基础信息 ===== -->
-            <section class="space-y-4">
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
               <h3 class="section-heading">
                 基础信息
               </h3>
@@ -1823,14 +1839,13 @@ function getTmdbPoster(item: TMDBBrief): string {
                 </div>
               </div>
 
-              <!-- 备用分享链接：主链接失效时自动切换 -->
+              <!-- 备用分享链接：主链接失效时自动切换（默认展开） -->
               <div class="rounded-md border border-[hsl(var(--border))] px-3 py-2">
                 <div class="flex items-center justify-between gap-2">
-                  <button class="flex items-center gap-1 text-sm font-medium text-[hsl(var(--foreground))]" @click="backupOpen = !backupOpen">
-                    <component :is="backupOpen ? ChevronUp : ChevronDown" class="h-3.5 w-3.5 text-[hsl(var(--muted-foreground))]" />
+                  <div class="flex items-center gap-1 text-sm font-medium text-[hsl(var(--foreground))]">
                     多源链接
                     <span v-if="backupLinks.length" class="rounded-full border border-[hsl(var(--primary))] px-1.5 text-[10px] text-[hsl(var(--primary))]">{{ backupLinks.length }}/{{ MAX_BACKUP_LINKS }}</span>
-                  </button>
+                  </div>
                   <div class="flex items-center gap-1">
                     <Button size="sm" variant="ghost" class="h-7 text-xs" :disabled="!state.shareurl.trim() || backupChecking" @click="checkAllShareLinks">
                       <Loader2 v-if="backupChecking" class="mr-1 h-3 w-3 animate-spin" />
@@ -1841,8 +1856,8 @@ function getTmdbPoster(item: TMDBBrief): string {
                     </Button>
                   </div>
                 </div>
-                <div v-if="backupOpen" class="mt-2 space-y-2">
-                  <p class="text-xs text-[hsl(var(--muted-foreground))]">每次运行按下表顺序依次对全部链接做一次转存，哪条内容先更新就先被转存。<span class="text-[hsl(var(--foreground))]">顺序 = 转存优先级</span>：同一集多源都有时，靠前的源先转存，靠后的因去重自动跳过（把画质/命名更好的源放在前面）。已标失效的链接不再请求；需与主链接同网盘类型；添加时自动定位一次</p>
+                <div class="mt-2 space-y-2">
+                  <p class="text-xs text-[hsl(var(--muted-foreground))]">顺序 = 转存优先级；已标失效的链接不再请求。</p>
                   <div v-if="!backupLinks.length" class="py-1 text-xs text-[hsl(var(--muted-foreground))]">暂无其它源链接</div>
                   <div
                     v-for="(row, idx) in backupLinks"
@@ -1941,8 +1956,10 @@ function getTmdbPoster(item: TMDBBrief): string {
               </label>
             </section>
 
+            <!-- ===== 右列：TMDB + 重命名 ===== -->
+            <div class="space-y-3">
             <!-- ===== TMDB 关联 ===== -->
-            <section class="space-y-4">
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
               <h3 class="section-heading">
                 TMDB 关联（可选）
               </h3>
@@ -2030,7 +2047,7 @@ function getTmdbPoster(item: TMDBBrief): string {
             </section>
 
             <!-- ===== 重命名规则 ===== -->
-            <section class="space-y-4">
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
               <h3 class="flex items-center justify-between section-heading">
                 <span>重命名规则（可选）</span>
                 <a
@@ -2044,7 +2061,6 @@ function getTmdbPoster(item: TMDBBrief): string {
                   使用说明
                 </a>
               </h3>
-              <!-- 内置规则选择 -->
               <div>
                 <label class="field-label">内置规则</label>
                 <select
@@ -2070,67 +2086,77 @@ function getTmdbPoster(item: TMDBBrief): string {
                 忽略扩展名
               </label>
             </section>
+            </div>
+            </div>
 
-            <!-- ===== 插件选项（紧凑折叠式） ===== -->
-            <section v-if="plugins.length > 0" class="space-y-4">
+            <!-- ===== 下部并联：插件 + 调度（插件字段平铺，无需展开） ===== -->
+            <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
+            <section v-if="plugins.length > 0" class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
               <h3 class="section-heading">
                 插件选项
               </h3>
-              <div class="space-y-2">
-                <div v-for="plugin in plugins" :key="plugin.plugin_key"
-                  class="overflow-hidden rounded-[0.6rem] border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/30">
-                  <!-- 标题行：点击展开/折叠 -->
-                  <div class="flex items-center justify-between px-3 py-2 cursor-pointer transition-colors hover:bg-[hsl(var(--accent))]"
-                    @click="togglePluginExpand(plugin.plugin_key)">
-                    <div class="flex items-center gap-2">
-                      <ChevronRight class="h-3.5 w-3.5 text-[hsl(var(--muted-foreground))] transition-transform"
-                        :class="expandedPlugins.has(plugin.plugin_key) ? 'rotate-90' : ''" />
-                      <span class="text-sm font-medium text-[hsl(var(--foreground))]">{{ plugin.plugin_key }}</span>
-                    </div>
-                    <!-- 启用开关（点击不冒泡） -->
-                    <div @click.stop>
-                      <input type="checkbox"
+              <div class="space-y-3">
+                <div
+                  v-for="plugin in plugins"
+                  :key="plugin.plugin_key"
+                  class="space-y-2 rounded-[0.6rem] border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-3"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-sm font-medium text-[hsl(var(--foreground))]">{{ plugin.plugin_key }}</span>
+                    <label class="inline-flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]">
+                      启用
+                      <input
+                        type="checkbox"
                         :checked="isPluginEnabled(plugin.plugin_key)"
+                        class="h-4 w-4 rounded border-[hsl(var(--border))]"
                         @change="togglePluginEnabled(plugin.plugin_key, $event)"
-                        class="h-4 w-4 rounded border-[hsl(var(--border))]" />
-                    </div>
+                      />
+                    </label>
                   </div>
-                  <!-- 展开内容 -->
-                  <div v-if="expandedPlugins.has(plugin.plugin_key)" class="px-3 pb-3 space-y-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--background))]">
-                    <div v-for="field in plugin.task_config_fields" :key="field.key" class="space-y-0.5 pt-2">
+                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div
+                      v-for="field in plugin.task_config_fields"
+                      :key="field.key"
+                      class="space-y-0.5"
+                      :class="{ 'opacity-50 pointer-events-none': !isPluginEnabled(plugin.plugin_key) }"
+                    >
                       <label class="field-label field-label--inline">{{ field.description || field.label || field.key }}</label>
-                      <!-- switch -->
                       <div v-if="field.input_type === 'switch'" class="flex items-center">
-                        <input type="checkbox"
+                        <input
+                          type="checkbox"
                           :checked="state.addition[plugin.plugin_key]?.[field.key]"
                           class="h-4 w-4 rounded border-[hsl(var(--border))]"
-                          @change="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: ($event.target as HTMLInputElement).checked }" />
+                          @change="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: ($event.target as HTMLInputElement).checked }"
+                        />
                       </div>
-                      <!-- number -->
-                      <Input v-else-if="field.input_type === 'number'" type="number"
+                      <Input
+                        v-else-if="field.input_type === 'number'"
+                        type="number"
                         :model-value="state.addition[plugin.plugin_key]?.[field.key] ?? ''"
                         class="h-8 text-sm"
-                        @update:model-value="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: $event ? Number($event) : null }" />
-                      <!-- textarea -->
-                      <textarea v-else-if="field.input_type === 'textarea'"
+                        @update:model-value="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: $event ? Number($event) : null }"
+                      />
+                      <textarea
+                        v-else-if="field.input_type === 'textarea'"
                         :value="state.addition[plugin.plugin_key]?.[field.key] ?? ''"
                         rows="2"
                         class="w-full rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-2 py-1 text-sm"
-                        @input="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: ($event.target as HTMLTextAreaElement).value }" />
-                      <!-- text/password -->
-                      <Input v-else
+                        @input="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: ($event.target as HTMLTextAreaElement).value }"
+                      />
+                      <Input
+                        v-else
                         :type="field.input_type === 'password' ? 'password' : 'text'"
                         :model-value="state.addition[plugin.plugin_key]?.[field.key] ?? ''"
                         class="h-8 text-sm"
-                        @update:model-value="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: $event }" />
+                        @update:model-value="state.addition[plugin.plugin_key] = { ...(state.addition[plugin.plugin_key] || {}), [field.key]: $event }"
+                      />
                     </div>
                   </div>
                 </div>
               </div>
             </section>
 
-            <!-- ===== 调度配置 ===== -->
-            <section class="space-y-4">
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
               <h3 class="section-heading">
                 调度配置（可选）
               </h3>
@@ -2166,37 +2192,27 @@ function getTmdbPoster(item: TMDBBrief): string {
                 <Input v-model="state.enddate" type="date" />
               </div>
             </section>
+            </div>
 
-            <!-- ===== 高级选项（折叠） ===== -->
-            <section class="space-y-3">
-              <button
-                type="button"
-                class="flex w-full items-center justify-between section-heading hover:text-[hsl(var(--primary))] transition-colors"
-                @click="advancedOpen = !advancedOpen"
-              >
-                <span>高级选项</span>
-                <ChevronUp v-if="advancedOpen" class="h-4 w-4" />
-                <ChevronDown v-else class="h-4 w-4" />
-              </button>
-
-              <div v-if="advancedOpen" class="space-y-4 pt-1">
-                <label class="flex items-center gap-2 text-sm text-[hsl(var(--foreground))] cursor-pointer">
+            <!-- ===== 高级选项（下部平铺展开） ===== -->
+            <section class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
+              <h3 class="section-heading">高级选项</h3>
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <label class="flex items-center gap-2 text-sm text-[hsl(var(--foreground))] cursor-pointer md:col-span-2">
                   <input v-model="state.enabled" type="checkbox" class="h-4 w-4 rounded border-[hsl(var(--border))] text-[hsl(var(--primary))]" />
                   启用任务
                 </label>
 
-                <!-- 关联同步任务（可排序多选） -->
-                <div>
+                <div class="md:col-span-2">
                   <label class="field-label">关联同步任务</label>
                   <div
                     v-if="syncTasks.length === 0"
-                    class="rounded-[0.6rem] border border-dashed border-[hsl(var(--border))] px-3 py-4 text-center text-xs text-[hsl(var(--muted-foreground))]"
+                    class="rounded-[0.6rem] border border-dashed border-[hsl(var(--border))] px-3 py-3 text-center text-xs text-[hsl(var(--muted-foreground))]"
                   >
                     暂无同步任务
                   </div>
-                  <div v-else class="space-y-2.5">
-                    <!-- 可选列表 -->
-                    <div class="max-h-44 overflow-y-auto rounded-[0.6rem] border border-[hsl(var(--border))] bg-[hsl(var(--background))]">
+                  <div v-else class="space-y-2">
+                    <div class="max-h-28 overflow-y-auto rounded-[0.6rem] border border-[hsl(var(--border))] bg-[hsl(var(--background))]">
                       <label
                         v-for="st in syncTasks"
                         :key="st.uid"
@@ -2217,12 +2233,11 @@ function getTmdbPoster(item: TMDBBrief): string {
                         <span class="sync-option__name">{{ st.name }}</span>
                       </label>
                     </div>
-                    <!-- 已选执行顺序 -->
                     <div
                       v-if="state.sync_task_uids.length > 0"
                       class="rounded-[0.6rem] border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/30 p-2"
                     >
-                      <div class="mb-1.5 flex items-center justify-between gap-2 px-0.5">
+                      <div class="mb-1 flex items-center justify-between gap-2 px-0.5">
                         <span class="text-[11px] font-medium text-[hsl(var(--foreground))]/75">
                           执行顺序 · {{ state.sync_task_uids.length }} 项
                         </span>
@@ -2243,22 +2258,10 @@ function getTmdbPoster(item: TMDBBrief): string {
                           <GripVertical class="sync-order__grip" />
                           <span class="sync-order__index">{{ index + 1 }}</span>
                           <span class="sync-order__name">{{ syncTasks.find(s => s.uid === uid)?.name || uid }}</span>
-                          <button
-                            type="button"
-                            class="icon-action h-6 w-6"
-                            title="上移"
-                            :disabled="index === 0"
-                            @click="moveSyncTask(index, -1)"
-                          >
+                          <button type="button" class="icon-action h-6 w-6" title="上移" :disabled="index === 0" @click="moveSyncTask(index, -1)">
                             <ArrowUp class="h-3 w-3" />
                           </button>
-                          <button
-                            type="button"
-                            class="icon-action h-6 w-6"
-                            title="下移"
-                            :disabled="index === state.sync_task_uids.length - 1"
-                            @click="moveSyncTask(index, 1)"
-                          >
+                          <button type="button" class="icon-action h-6 w-6" title="下移" :disabled="index === state.sync_task_uids.length - 1" @click="moveSyncTask(index, 1)">
                             <ArrowDown class="h-3 w-3" />
                           </button>
                         </div>
@@ -2267,7 +2270,6 @@ function getTmdbPoster(item: TMDBBrief): string {
                   </div>
                 </div>
 
-                <!-- 排序索引 -->
                 <div>
                   <label class="field-label">排序索引 (sort_index)</label>
                   <Input
@@ -2278,7 +2280,6 @@ function getTmdbPoster(item: TMDBBrief): string {
                   />
                 </div>
 
-                <!-- 起始集数（兼容字段名 startfid） -->
                 <div>
                   <label class="field-label">起始集数 (startfid)</label>
                   <div class="flex gap-2">
@@ -2289,17 +2290,15 @@ function getTmdbPoster(item: TMDBBrief): string {
                     </Button>
                   </div>
                   <p class="mt-1 text-[11px] text-[hsl(var(--muted-foreground))]">
-                    按重命名规则提取剧集号后过滤；换分享链接后仍有效，无需重选。
+                    按重命名规则提取剧集号后过滤；换分享链接后仍有效。
                   </p>
                 </div>
 
-                <!-- 更新子目录 -->
                 <div>
                   <label class="field-label">更新子目录 (update_subdir)</label>
                   <Input v-model="state.update_subdir" placeholder="如 Season 1" />
                 </div>
 
-                <!-- 子目录重存模式 -->
                 <div>
                   <label class="field-label">子目录重存模式</label>
                   <select
@@ -2359,21 +2358,22 @@ function getTmdbPoster(item: TMDBBrief): string {
 </template>
 
 <style scoped>
-.sheet-right-enter-active,
-.sheet-right-leave-active {
+.task-modal-enter-active,
+.task-modal-leave-active {
   transition: opacity 0.2s ease;
 }
-.sheet-right-enter-active > div:last-child,
-.sheet-right-leave-active > div:last-child {
-  transition: transform 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+.task-modal-enter-active > div:last-child,
+.task-modal-leave-active > div:last-child {
+  transition: transform 0.2s ease, opacity 0.2s ease;
 }
-.sheet-right-enter-from,
-.sheet-right-leave-to {
+.task-modal-enter-from,
+.task-modal-leave-to {
   opacity: 0;
 }
-.sheet-right-enter-from > div:last-child,
-.sheet-right-leave-to > div:last-child {
-  transform: translateX(100%);
+.task-modal-enter-from > div:last-child,
+.task-modal-leave-to > div:last-child {
+  transform: translateY(12px) scale(0.98);
+  opacity: 0;
 }
 
 /* ===== 关联同步任务：可选行（iOS 分组列表风格，自绘勾选框代替原生 checkbox） ===== */

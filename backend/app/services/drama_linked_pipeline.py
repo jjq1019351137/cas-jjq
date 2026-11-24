@@ -347,47 +347,14 @@ def run_cas_strm_stage(
 
     log.set_stage("linked_cas_delta")
     log.section("增量 CAS 生成")
-    if not cas_root_dir_configured:
-        log.line("SKIP: 未配置 CAS 文件生成目录，跳过 CAS 增量生成")
-    else:
-        for account_id, payload in sorted(delta_by_account.items(), key=lambda it: it[0]):
-            dir_paths = sorted(payload.get("dir_paths") or set())
-            file_paths = sorted(payload.get("file_paths") or set())
-            with SessionLocal() as db:
-                try:
-                    task = submit_dl302_cas_task_delta(
-                        int(account_id),
-                        db,
-                        base_path=cas_base_path_by_account.get(account_id),
-                        dir_paths=dir_paths,
-                        file_paths=file_paths,
-                    )
-                    db.commit()
-                    cas_tasks.append(task)
-                    log.line(
-                        f"OK: account_id={account_id} task_id={str(task.get('task_id') or '')} "
-                        f"total={int(task.get('total_items') or 0)} skipped={int(task.get('skipped_items') or 0)}"
-                    )
-                except Exception as exc:
-                    db.rollback()
-                    msg = str(getattr(exc, "message", None) or str(exc) or type(exc).__name__).strip()
-                    log.line(f"WARN: account_id={account_id} CAS 增量提交失败 err={msg}")
+    # 当前版本已移除 dl302 二进制：CAS / STRM 联动跳过
+    log.line("SKIP: 当前版本已移除 302/CAS 引擎")
+    _ = (cas_root_dir_configured, delta_by_account, cas_base_path_by_account, account_base_path, source)
 
     log.set_stage("linked_strm_rebuild")
     log.section("STRM 重建（本地）")
     strm_result: dict[str, Any] | None = None
-    with SessionLocal() as db:
-        try:
-            strm_result = rebuild_dl302_strm(db, trigger=str(source or "linked_pipeline"), request=None)
-            db.commit()
-            log.line(
-                f"OK: mode={str(strm_result.get('mode') if strm_result else '')} "
-                f"files={int(strm_result.get('generated_files') if strm_result else 0)}"
-            )
-        except Exception as exc:
-            db.rollback()
-            msg = str(getattr(exc, "message", None) or str(exc) or type(exc).__name__).strip()
-            log.line(f"WARN: STRM 重建失败 err={msg}")
+    log.line("SKIP: 当前版本已移除 302/CAS 引擎")
 
     return cas_tasks, strm_result
 
