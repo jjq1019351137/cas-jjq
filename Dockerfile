@@ -17,7 +17,9 @@ COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 COPY backend/ /app/backend/
 
-# ---------- runtime (nginx + uvicorn) ----------
+# ---------- runtime (nginx + uvicorn + CAS/dl302) ----------
+# 精简：去掉 mkvtoolnix / exiftool / MySQL 迁移 / nginx headers-more；
+# 保留 dl302 二进制（网盘同步 CAS 复制依赖它；302 代理 UI/nginx /dl 已移除）
 FROM python:3.13-alpine
 ARG TARGETARCH
 ARG BUILD_SHA
@@ -30,7 +32,7 @@ ENV BUILD_SHA=$BUILD_SHA \
 
 WORKDIR /app
 
-RUN apk add --no-cache nginx nginx-mod-http-headers-more supervisor tzdata ca-certificates libffi openssl exiftool mkvtoolnix \
+RUN apk add --no-cache nginx supervisor tzdata ca-certificates libffi openssl \
     && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && mkdir -p /run/nginx /var/log/supervisor /app/backend/data
 
@@ -48,8 +50,6 @@ RUN case "$TARGETARCH" in \
     && rm -f /tmp/dl302-linux-amd64 /tmp/dl302-linux-arm64
 
 COPY default /etc/nginx/http.d/default.conf
-COPY migrate-to-mysql.sh /app/migrate-to-mysql.sh
-RUN chmod +x /app/migrate-to-mysql.sh
 
 RUN printf '%s\n' \
     '[unix_http_server]' \
@@ -92,10 +92,9 @@ RUN printf '%s\n' \
     '' \
     '[supervisorctl]' \
     'serverurl=unix:///run/supervisor.sock' \
-    > /etc/supervisord.conf \
-    && chmod +x /app/dl302
+    > /etc/supervisord.conf
 
 ENV TZ="Asia/Shanghai"
 
-EXPOSE 5115 5225
+EXPOSE 5115
 CMD ["/usr/bin/supervisord","-c","/etc/supervisord.conf"]

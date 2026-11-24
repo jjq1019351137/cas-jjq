@@ -21,8 +21,8 @@ class SyncEndpoint(BaseModel):
 class SyncStrategy(BaseModel):
     overwrite: bool = False
     one_way_delete_extras: bool = False
-    # 单向删除多余文件延时（分钟）：0/5/10/15/20/25/30，0 表示同步完成后立即删除
-    one_way_delete_extras_delay_minutes: int = Field(default=0, ge=0, le=30)
+    # 单向删除多余文件延时（分钟）：0/5/10/15/20/25/30，0 立即删除；默认 5 分钟（独立调度）
+    one_way_delete_extras_delay_minutes: int = Field(default=5, ge=0, le=30)
 
     @field_validator("one_way_delete_extras_delay_minutes", mode="before")
     @classmethod

@@ -94,7 +94,7 @@ SYNC_FIELDS: list[dict[str, Any]] = [
     {"key": "mode", "label": "同步模式", "type": "enum", "options": ["one_way", "two_way"], "default": "one_way"},
     {"key": "strategy.overwrite", "label": "允许覆盖", "type": "bool", "default": False},
     {"key": "strategy.one_way_delete_extras", "label": "单向删除多余文件", "type": "bool", "default": False},
-    {"key": "strategy.one_way_delete_extras_delay_minutes", "label": "删除延时(分钟)", "type": "int", "default": 0},
+    {"key": "strategy.one_way_delete_extras_delay_minutes", "label": "删除延时(分钟)", "type": "int", "default": 5},
     {"key": "strategy.unzip_zip_after_sync", "label": "同步ZIP后解压", "type": "bool", "default": True},
     {"key": "strategy.force_refresh", "label": "强制刷新目录", "type": "bool", "default": False},
     {"key": "strategy.concurrency", "label": "并发数", "type": "int", "default": 4},

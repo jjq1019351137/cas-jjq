@@ -7,7 +7,6 @@ import {
   Film,
   RefreshCw,
   HardDrive,
-  Globe,
   Settings,
   Users,
 } from 'lucide-vue-next'
@@ -40,7 +39,6 @@ const navItems = computed(() => {
     { path: '/tasks', label: '任务', icon: Film, permission: TASK_READ, tour: 'nav-tasks' },
     { path: '/sync', label: '同步', icon: RefreshCw, permission: SYNC_READ, tour: 'nav-sync' },
     { path: '/drives', label: '网盘', icon: HardDrive, permission: DRIVE_ACCOUNT_READ, tour: 'nav-drives' },
-    { path: '/dl302', label: '302', icon: Globe, permission: null, tour: 'nav-dl302' },
     { path: '/settings', label: '设置', icon: Settings, permission: null, tour: 'nav-settings' },
     { path: '/users', label: '用户', icon: Users, permission: USER_READ, tour: 'nav-users' },
   ]

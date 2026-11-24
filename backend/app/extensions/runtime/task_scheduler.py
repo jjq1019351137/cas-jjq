@@ -94,6 +94,20 @@ class TaskSchedulerManager:
             )
         except Exception as e:
             logger.error(f"同步执行兜底调度加载失败: {e}")
+        try:
+            from app.services.deferred_sync_delete import process_due_deferred_sync_deletes
+
+            self.scheduler.add_job(
+                process_due_deferred_sync_deletes,
+                trigger=CronTrigger(minute="*", timezone="Asia/Shanghai"),
+                id="deferred_sync_delete_poll",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
+            )
+        except Exception as e:
+            logger.error(f"延时删除轮询调度加载失败: {e}")
     def shutdown(self) -> None:
         if self.scheduler is None:
             return

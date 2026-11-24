@@ -41,12 +41,6 @@ export const appRoutes: RouteRecordRaw[] = [
         meta: { title: '网盘账号', permission: DRIVE_ACCOUNT_READ },
       },
       {
-        path: 'dl302',
-        name: 'dl302',
-        component: () => import('@/pages/Dl302Page.vue'),
-        meta: { title: '302 代理' },
-      },
-      {
         path: 'settings',
         name: 'settings',
         component: () => import('@/pages/SettingsPage.vue'),

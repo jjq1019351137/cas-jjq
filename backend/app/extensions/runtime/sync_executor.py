@@ -952,9 +952,11 @@ class SyncExecutor:
                 v = default
             return max(lo, min(hi, v))
 
-        delay_raw = _i("one_way_delete_extras_delay_minutes", 0, 0, 30)
-        # 仅允许 0 或 5 的倍数，非法值向下取整到合法档位
-        delay_minutes = 0 if delay_raw <= 0 else min(30, (delay_raw // 5) * 5)
+        delay_raw = _i("one_way_delete_extras_delay_minutes", 5, 0, 30)
+        # 仅允许 0 或 5 的倍数，非法值向下取整到合法档位；开启删除且未显式配置时默认 5 分钟
+        delay_minutes = 0 if delay_raw <= 0 else min(30, max(5, (delay_raw // 5) * 5))
+        if _b("one_way_delete_extras", False) and "one_way_delete_extras_delay_minutes" not in base:
+            delay_minutes = 5
         return Strategy(
             overwrite=_b("overwrite", False),
             one_way_delete_extras=_b("one_way_delete_extras", False),
@@ -1442,24 +1444,39 @@ class SyncExecutor:
         # 1) 先复制
         _dispatch(copy_actions + other_actions)
 
-        # 2) 单向删除多余：可选延时（同步执行仍占用，可取消）
+        # 2) 单向删除多余：延时>0 时落盘并由独立调度触发，避免占用同步进程
         if delete_actions:
-            delay_min = int(getattr(strategy, "one_way_delete_extras_delay_minutes", 0) or 0)
+            delay_min = int(getattr(strategy, "one_way_delete_extras_delay_minutes", 5) or 0)
             if delay_min > 0:
-                log.set_stage("delete_delay")
-                log.section("删除多余文件延时")
-                log.line(f"延时 {delay_min} 分钟后删除多余文件（可取消）")
+                from app.services.deferred_sync_delete import schedule_deferred_sync_deletes
+
+                log.set_stage("delete_scheduled")
+                log.section("删除多余文件延时（独立任务）")
+                log.line(f"已调度：{delay_min} 分钟后删除 {len(delete_actions)} 项多余文件")
+                job = schedule_deferred_sync_deletes(
+                    sync_task_id=0,
+                    execution_id=int(sync_execution_id or 0),
+                    delay_minutes=delay_min,
+                    actions=delete_actions,
+                    strategy={
+                        "overwrite": bool(strategy.overwrite),
+                        "one_way_delete_extras": True,
+                        "one_way_delete_extras_delay_minutes": int(delay_min),
+                        "force_refresh": bool(strategy.force_refresh),
+                        "concurrency": int(strategy.concurrency),
+                        "request_interval_seconds": float(strategy.request_interval_seconds),
+                        "openlist_copy_batch_size": int(strategy.openlist_copy_batch_size),
+                        "unzip_zip_after_sync": bool(strategy.unzip_zip_after_sync),
+                    },
+                )
+                if job:
+                    stats["deferred_delete_job_id"] = str(job.get("id") or "")
+                    stats["deferred_delete_run_at"] = str(job.get("run_at") or "")
+                    stats["deferred_delete_status"] = "scheduled"
+                    stats["deferred_delete_count"] = len(delete_actions)
                 on_persist(True)
-                deadline = _now_ts() + float(delay_min) * 60.0
-                while True:
-                    if cancel_checker is not None:
-                        cancel_checker.raise_if_cancelled()
-                    remain = deadline - _now_ts()
-                    if remain <= 0:
-                        break
-                    time.sleep(min(5.0, remain))
-                log.line("延时结束，开始删除多余文件")
-            _dispatch(delete_actions)
+            else:
+                _dispatch(delete_actions)
 
         # 3) 复制成功的 zip：解压 → 按前缀重命名 → 删 zip（放在删除多余之后，避免解压出的文件被当成多余删掉）
         if bool(getattr(strategy, "unzip_zip_after_sync", True)):

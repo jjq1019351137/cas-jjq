@@ -6,35 +6,25 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
 import { Puzzle, RefreshCw, Settings2, X } from 'lucide-vue-next'
-import { usePluginsQuery, useSyncPluginsQuery } from '@/hooks/queries/extensions'
+import { usePluginsQuery } from '@/hooks/queries/extensions'
 import { useMutation, useQueryClient } from '@tanstack/vue-query'
-import { updatePlugin, refreshPlugins, updateSyncPlugin, refreshSyncPlugins } from '@/api/extensions'
+import { updatePlugin, refreshPlugins } from '@/api/extensions'
 import type { PluginItem, ConfigFieldItem } from '@/types/extensions'
 
-const activeTab = ref<'cas' | 'sync'>('cas')
 const queryClient = useQueryClient()
 
-const { data: casPlugins, isLoading: casLoading } = usePluginsQuery()
-const { data: syncPlugins, isLoading: syncLoading } = useSyncPluginsQuery()
-
-const plugins = computed(() => activeTab.value === 'cas' ? casPlugins.value : syncPlugins.value)
-const isLoading = computed(() => activeTab.value === 'cas' ? casLoading.value : syncLoading.value)
-
-const queryKeys = computed(() => activeTab.value === 'cas' ? ['plugins'] : ['sync-plugins'])
+const { data: plugins, isLoading } = usePluginsQuery()
 
 // --- Toggle mutation ---
 const toggleMutation = useMutation({
-  mutationFn: ({ key, enabled }: { key: string; enabled: boolean }) =>
-    activeTab.value === 'cas'
-      ? updatePlugin(key, { enabled })
-      : updateSyncPlugin(key, { enabled }),
-  onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.value }),
+  mutationFn: ({ key, enabled }: { key: string; enabled: boolean }) => updatePlugin(key, { enabled }),
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['plugins'] }),
 })
 
 // --- Refresh mutation ---
 const refreshMutation = useMutation({
-  mutationFn: () => activeTab.value === 'cas' ? refreshPlugins() : refreshSyncPlugins(),
-  onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.value }),
+  mutationFn: () => refreshPlugins(),
+  onSuccess: () => queryClient.invalidateQueries({ queryKey: ['plugins'] }),
 })
 
 // --- Config Sheet ---
@@ -67,12 +57,10 @@ function closeSheet() {
 const saveMutation = useMutation({
   mutationFn: (payload: { enabled: boolean; priority: number; config: Record<string, any> }) => {
     const key = currentPlugin.value!.plugin_key
-    return activeTab.value === 'cas'
-      ? updatePlugin(key, payload)
-      : updateSyncPlugin(key, payload)
+    return updatePlugin(key, payload)
   },
   onSuccess: () => {
-    queryClient.invalidateQueries({ queryKey: queryKeys.value })
+    queryClient.invalidateQueries({ queryKey: ['plugins'] })
     sheetOpen.value = false
   },
 })
@@ -102,12 +90,9 @@ function startEditPriority(plugin: PluginItem) {
 }
 
 const priorityMutation = useMutation({
-  mutationFn: ({ key, priority }: { key: string; priority: number }) =>
-    activeTab.value === 'cas'
-      ? updatePlugin(key, { priority })
-      : updateSyncPlugin(key, { priority }),
+  mutationFn: ({ key, priority }: { key: string; priority: number }) => updatePlugin(key, { priority }),
   onSuccess: () => {
-    queryClient.invalidateQueries({ queryKey: queryKeys.value })
+    queryClient.invalidateQueries({ queryKey: ['plugins'] })
     editingPriority.value = null
   },
 })
@@ -128,30 +113,12 @@ function statusColor(status?: string | null) {
     <div class="mb-5 flex items-center justify-between">
       <div>
         <h2 class="text-lg font-semibold text-[hsl(var(--foreground))]">🧩 插件管理</h2>
-        <p class="mt-0.5 text-sm text-[hsl(var(--muted-foreground))]">管理转存/同步后置插件</p>
+        <p class="mt-0.5 text-sm text-[hsl(var(--muted-foreground))]">仅保留 OpenList 转存插件</p>
       </div>
       <Button variant="outline" size="sm" :disabled="refreshMutation.isPending.value" @click="refreshMutation.mutate()">
         <RefreshCw class="mr-1 h-4 w-4" :class="{ 'animate-spin': refreshMutation.isPending.value }" />
         扫描插件
       </Button>
-    </div>
-
-    <!-- Tab bar -->
-    <div class="mb-4 flex gap-1 rounded-lg bg-[hsl(var(--muted))] p-1 w-fit">
-      <button
-        class="rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
-        :class="activeTab === 'cas' ? 'bg-[hsl(var(--background))] text-[hsl(var(--foreground))] shadow-sm' : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]'"
-        @click="activeTab = 'cas'"
-      >
-        转存插件
-      </button>
-      <button
-        class="rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
-        :class="activeTab === 'sync' ? 'bg-[hsl(var(--background))] text-[hsl(var(--foreground))] shadow-sm' : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]'"
-        @click="activeTab = 'sync'"
-      >
-        同步插件
-      </button>
     </div>
 
     <!-- Loading -->
