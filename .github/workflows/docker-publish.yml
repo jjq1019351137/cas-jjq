@@ -14,8 +14,7 @@ on:
       - "v*"
 
 env:
-  # Docker Hub 仓库名（与 GitHub repo 分离）；可用 secret 覆盖用户名
-  IMAGE_NAME: jjq19920608/cas-jjq
+  IMAGE_REPO: cas-jjq
   ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
 
 jobs:
@@ -31,11 +30,11 @@ jobs:
         id: image
         run: |
           user="${{ secrets.DOCKERHUB_USERNAME }}"
-          if [[ -n "$user" ]]; then
-            echo "NAME=${user}/cas-jjq" >> "$GITHUB_OUTPUT"
-          else
-            echo "NAME=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          if [[ -z "$user" ]]; then
+            echo "::error::DOCKERHUB_USERNAME secret is not set"
+            exit 1
           fi
+          echo "NAME=${user}/${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels) for Docker Hub
         id: meta_dockerhub
@@ -46,6 +45,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Extract metadata (tags, labels) for Aliyun
         id: meta_aliyun
@@ -56,6 +56,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Get version
         id: get_version
