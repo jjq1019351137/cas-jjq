@@ -145,6 +145,11 @@ class TaskOut(BaseModel):
     tmdb_status: str | None = None
     tmdb_is_ended: bool | None = None
     drama_update_progress: DramaUpdateProgressOut | None = None
+    # TMDB 推断的更新日（ISO：周一=1 … 周日=7），用于前端判断「今日是否会触发」
+    tmdb_episode_weekdays: list[int] = []
+    tmdb_update_weekdays: list[int] = []
+    # 按与调度相同的规则：今日是否会真正跑追剧任务
+    would_run_today: bool = False
     enabled: bool
     addition: dict[str, Any] = {}
     extra: dict[str, Any] = {}

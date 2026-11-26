@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -48,27 +48,69 @@ const streamLogTaskId = ref<number | null>(null)
 const deleteDialogOpen = ref(false)
 const taskToDelete = ref<SyncTaskItem | null>(null)
 
-// Track running tasks (by checking latest execution status)
+// Track running tasks — 必须整体替换 Set，保证 Vue 响应式更新底色
 const runningTaskIds = ref<Set<number>>(new Set())
+let runningPollTimer: ReturnType<typeof setInterval> | null = null
 
-// Sync runningTaskIds from backend is_running field on data load
+function setRunningIds(next: Set<number>) {
+  runningTaskIds.value = next
+}
+
+function markRunning(id: number) {
+  const next = new Set(runningTaskIds.value)
+  next.add(id)
+  setRunningIds(next)
+}
+
+function unmarkRunning(id: number) {
+  if (!runningTaskIds.value.has(id)) return
+  const next = new Set(runningTaskIds.value)
+  next.delete(id)
+  setRunningIds(next)
+}
+
+function clearRunning() {
+  setRunningIds(new Set())
+}
+
+function syncRunningFromTasks() {
+  const taskList = tasks.value
+  if (!taskList) return
+  const next = new Set<number>()
+  for (const t of taskList) {
+    if (t.is_running) next.add(t.id)
+  }
+  setRunningIds(next)
+}
+
 watch(
   () => tasks.value,
-  (taskList) => {
-    if (!taskList) return
-    const next = new Set<number>(runningTaskIds.value)
-    for (const t of taskList) {
-      if (t.is_running) {
-        next.add(t.id)
-      } else if (!streamLogVisible.value || !streamLogUrl.value.includes(`/${t.id}/`)) {
-        // Only remove if we're not currently streaming this task's log
-        next.delete(t.id)
-      }
-    }
-    runningTaskIds.value = next
-  },
+  () => syncRunningFromTasks(),
   { immediate: true },
 )
+
+watch(
+  runningTaskIds,
+  (ids) => {
+    const hasRunning = ids.size > 0 || (tasks.value || []).some((t) => t.is_running)
+    if (hasRunning && !runningPollTimer) {
+      runningPollTimer = setInterval(() => {
+        refetchTasks()
+      }, 2500)
+    } else if (!hasRunning && runningPollTimer) {
+      clearInterval(runningPollTimer)
+      runningPollTimer = null
+    }
+  },
+  { deep: true },
+)
+
+onUnmounted(() => {
+  if (runningPollTimer) {
+    clearInterval(runningPollTimer)
+    runningPollTimer = null
+  }
+})
 
 const selectedTask = computed(() =>
   tasks.value?.find((t) => t.id === selectedTaskId.value) ?? null,
@@ -96,7 +138,7 @@ function handleRun(task: SyncTaskItem) {
   streamLogMethod.value = 'POST'
   streamLogTaskId.value = task.id
   streamLogVisible.value = true
-  runningTaskIds.value.add(task.id)
+  markRunning(task.id)
 }
 
 function handleViewLog(task: SyncTaskItem) {
@@ -117,7 +159,8 @@ function handleStop(task: SyncTaskItem) {
         {
           onSuccess: () => {
             toast.success('已请求停止')
-            runningTaskIds.value.delete(task.id)
+            unmarkRunning(task.id)
+            refetchTasks()
           },
           onError: (err: any) => {
             toast.error('停止失败', { description: extractErrorMessage(err, '停止失败') })
@@ -126,7 +169,8 @@ function handleStop(task: SyncTaskItem) {
       )
     } else {
       toast.info('当前无运行中的执行')
-      runningTaskIds.value.delete(task.id)
+      unmarkRunning(task.id)
+      refetchTasks()
     }
   })
 }
@@ -174,9 +218,22 @@ function handleSheetClose() {
 }
 
 function handleStreamLogDone() {
-  // Refresh running state when stream ends
-  runningTaskIds.value.clear()
-  refetchTasks()
+  const finishedId = streamLogTaskId.value
+  if (finishedId != null) unmarkRunning(finishedId)
+  else clearRunning()
+  streamLogVisible.value = false
+  streamLogTaskId.value = null
+  refetchTasks().then(() => syncRunningFromTasks())
+}
+
+function handleStreamLogVisible(visible: boolean) {
+  streamLogVisible.value = visible
+  if (!visible) {
+    const finishedId = streamLogTaskId.value
+    if (finishedId != null) unmarkRunning(finishedId)
+    streamLogTaskId.value = null
+    refetchTasks().then(() => syncRunningFromTasks())
+  }
 }
 
 function openCreateSheet() {
@@ -309,7 +366,7 @@ function execStatusClass(status: string): string {
     </div>
 
     <!-- Loading -->
-    <div v-if="isLoading" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div v-if="isLoading" class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
       <Skeleton v-for="i in 4" :key="i" class="h-[180px] rounded-lg" />
     </div>
 
@@ -330,13 +387,13 @@ function execStatusClass(status: string): string {
     </div>
 
     <!-- Task Grid -->
-    <div v-else class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
       <SyncTaskCard
         v-for="task in tasks"
         :key="task.id"
         :task="task"
         :selected="selectedTaskId === task.id"
-        :running="runningTaskIds.has(task.id)"
+        :running="task.is_running || runningTaskIds.has(task.id)"
         @select="handleSelect"
         @run="handleRun"
         @stop="handleStop"
@@ -412,7 +469,7 @@ function execStatusClass(status: string): string {
       :title="streamLogTitle"
       :method="streamLogMethod"
       :task-id="streamLogTaskId"
-      @update:visible="streamLogVisible = $event"
+      @update:visible="handleStreamLogVisible"
       @done="handleStreamLogDone"
     />
 

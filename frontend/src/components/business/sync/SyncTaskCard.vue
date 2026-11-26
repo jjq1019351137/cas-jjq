@@ -67,26 +67,23 @@ const lastTime = computed(() => {
 
 <template>
   <Card
-    class="flex flex-col gap-3 p-4 cursor-pointer transition-all hover:shadow-md"
+    class="sync-card flex flex-col gap-2 p-3 cursor-pointer transition-all hover:shadow-md"
     :class="[
       selected ? 'ring-2 ring-[hsl(var(--primary))]' : '',
       !task.enabled && !running ? 'grayscale-[60%] opacity-70' : '',
+      running ? 'sync-card--running' : '',
     ]"
+    :title="running ? '同步执行中' : undefined"
     @click="emit('select', task)"
   >
-    <!-- Row 1: Name + Status -->
     <div class="flex items-center justify-between gap-2">
-      <h3 class="text-sm font-semibold text-[hsl(var(--foreground))] line-clamp-1 flex-1 min-w-0">
+      <h3 class="text-[0.82rem] font-semibold text-[hsl(var(--foreground))] line-clamp-1 flex-1 min-w-0">
         {{ task.name }}
       </h3>
       <div class="flex items-center gap-1.5 flex-shrink-0">
-        <!-- Pulse dot for running -->
-        <span
-          v-if="running"
-          class="relative flex h-2 w-2"
-        >
-          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-[hsl(var(--chart-2))] opacity-75" />
-          <span class="relative inline-flex rounded-full h-2 w-2 bg-[hsl(var(--chart-2))]" />
+        <span v-if="running" class="relative flex h-2 w-2">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-[hsl(145_70%_45%)] opacity-75" />
+          <span class="relative inline-flex rounded-full h-2 w-2 bg-[hsl(145_70%_45%)]" />
         </span>
         <Badge :class="statusClass" class="text-[10px] px-1.5 py-0">
           {{ statusLabel }}
@@ -94,7 +91,6 @@ const lastTime = computed(() => {
       </div>
     </div>
 
-    <!-- Row 2: Source path -->
     <div class="space-y-1 text-xs text-[hsl(var(--muted-foreground))]">
       <div class="flex items-center gap-1.5 min-w-0">
         <FolderOutput class="h-3.5 w-3.5 flex-shrink-0 text-[hsl(var(--chart-1))]" />
@@ -103,7 +99,6 @@ const lastTime = computed(() => {
         </span>
         <span class="truncate flex-1 min-w-0" :title="task.source.path">{{ endpointPath(task.source) }}</span>
       </div>
-      <!-- Row 3: Target path -->
       <div class="flex items-center gap-1.5 min-w-0">
         <FolderInput class="h-3.5 w-3.5 flex-shrink-0 text-[hsl(var(--chart-4))]" />
         <span class="inline-flex items-center px-1 py-0 rounded text-[10px] font-medium bg-[hsl(var(--chart-4))]/10 text-[hsl(var(--chart-4))]">
@@ -113,7 +108,6 @@ const lastTime = computed(() => {
       </div>
     </div>
 
-    <!-- Row 4: Metadata compact line -->
     <div class="flex items-center gap-2 text-[11px] text-[hsl(var(--muted-foreground))]">
       <span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[hsl(var(--muted))]">
         {{ modeLabel }}
@@ -124,65 +118,80 @@ const lastTime = computed(() => {
       <span>最近: {{ lastTime }}</span>
     </div>
 
-    <!-- Row 5: Actions -->
-    <div class="flex items-center gap-1 pt-1 border-t border-[hsl(var(--border))]">
+    <div
+      class="sync-card__foot flex items-center gap-0.5 pt-1.5 -mx-3 -mb-3 px-2.5 pb-2 border-t border-[hsl(var(--border))]"
+      :class="running ? 'sync-card__foot--running' : ''"
+    >
       <Button
         v-if="running"
         variant="ghost"
         size="icon"
-        class="h-7 w-7"
+        class="h-6 w-6"
         title="停止"
         @click.stop="emit('stop', task)"
       >
-        <Square class="h-3.5 w-3.5 text-[hsl(var(--destructive))]" />
+        <Square class="h-3 w-3 text-[hsl(var(--destructive))]" />
       </Button>
       <Button
         v-else
         variant="ghost"
         size="icon"
-        class="h-7 w-7"
+        class="h-6 w-6"
         title="运行"
         @click.stop="emit('run', task)"
       >
-        <Play class="h-3.5 w-3.5 text-[hsl(var(--chart-2))]" />
+        <Play class="h-3 w-3 text-[hsl(var(--chart-2))]" />
       </Button>
       <Button
         v-if="running"
         variant="ghost"
         size="icon"
-        class="h-7 w-7"
+        class="h-6 w-6"
         title="查看日志"
         @click.stop="emit('viewLog', task)"
       >
-        <FileText class="h-3.5 w-3.5 text-[hsl(var(--chart-1))]" />
+        <FileText class="h-3 w-3 text-[hsl(var(--chart-1))]" />
       </Button>
       <Button
         variant="ghost"
         size="icon"
-        class="h-7 w-7"
+        class="h-6 w-6"
         title="编辑"
         @click.stop="emit('edit', task)"
       >
-        <Pencil class="h-3.5 w-3.5" />
+        <Pencil class="h-3 w-3" />
       </Button>
       <Button
         variant="ghost"
         size="icon"
-        class="h-7 w-7"
+        class="h-6 w-6"
         :title="task.enabled ? '禁用' : '启用'"
         @click.stop="emit('toggle', task)"
       >
-        <Power class="h-3.5 w-3.5" :class="task.enabled ? 'text-[hsl(var(--chart-2))]' : 'text-[hsl(var(--muted-foreground))]'" />
+        <Power class="h-3 w-3" :class="task.enabled ? 'text-[hsl(var(--chart-2))]' : 'text-[hsl(var(--muted-foreground))]'" />
       </Button>
       <Button
         variant="ghost"
         size="icon"
-        class="h-7 w-7 text-[hsl(var(--destructive))] hover:text-red-600"
+        class="h-6 w-6 text-[hsl(var(--destructive))] hover:text-red-600"
         title="删除"
         @click.stop="emit('delete', task)"
       >
-        <Trash2 class="h-3.5 w-3.5" />
+        <Trash2 class="h-3 w-3" />
       </Button>
     </div>
   </Card>
 </template>
+
+<style scoped>
+.sync-card--running {
+  background: hsl(145 75% 42% / 0.32) !important;
+  border-color: hsl(145 75% 45% / 0.65) !important;
+  box-shadow: 0 0 0 2px hsl(145 75% 45% / 0.35);
+}
+
+.sync-card__foot--running {
+  background: hsl(145 75% 42% / 0.5);
+  border-top-color: hsl(145 75% 45% / 0.55);
+}
+</style>

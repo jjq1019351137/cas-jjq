@@ -78,6 +78,11 @@ export type TaskItem = {
     snapshot_captured_at?: string | null
     reason?: string | null
   } | null
+  /** TMDB 推断更新日（ISO 周一=1…周日=7） */
+  tmdb_episode_weekdays?: number[]
+  tmdb_update_weekdays?: number[]
+  /** 后端按调度规则计算：今日是否会触发 */
+  would_run_today?: boolean
   enabled: boolean
   addition: Record<string, any>
   extra: TaskExtraConfig

@@ -219,6 +219,142 @@ def _load_tmdb_payload_map(db: Session, items: list[object]) -> dict[tuple[str, 
     return out
 
 
+def _load_tmdb_weekdays_map(
+    db: Session,
+    items: list[object],
+    *,
+    tmdb_payload_map: dict[tuple[str, int], dict[str, object] | None] | None = None,
+) -> dict[tuple[str, int], tuple[list[int], list[int]]]:
+    """返回 (episode_weekdays, update_weekdays)，与追剧调度规则一致。"""
+    from app.services.tmdb_cache import infer_tv_episode_weekdays_from_details
+
+    keys: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for item in items:
+        if str(getattr(item, "task_type", "") or "") != "drama":
+            continue
+        key = _tmdb_cache_key(item)
+        if key is None or key in seen or key[0] != "tv":
+            continue
+        seen.add(key)
+        keys.append(key)
+    if not keys:
+        return {}
+
+    language, poster_language = _tmdb_lang_pair(db)
+    tv_ids = [tid for _, tid in keys]
+    rows = (
+        db.execute(
+            select(TMDBMediaCache.tmdb_id, TMDBMediaCache.update_weekdays_json, TMDBMediaCache.payload_json)
+            .where(
+                TMDBMediaCache.media_type == "tv",
+                TMDBMediaCache.tmdb_id.in_(tv_ids),
+                TMDBMediaCache.language == language,
+                TMDBMediaCache.poster_language == poster_language,
+            )
+            .order_by(TMDBMediaCache.updated_at.desc())
+        )
+        .all()
+    )
+    out: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
+    for tid, weekdays_json, payload_json in rows:
+        key = ("tv", int(tid))
+        if key in out:
+            continue
+        update_weekdays: list[int] = []
+        if weekdays_json:
+            try:
+                parsed = json.loads(weekdays_json)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                update_weekdays = [int(x) for x in parsed if str(x).strip().lstrip("-").isdigit() and 1 <= int(x) <= 7]
+        payload = None
+        if isinstance(tmdb_payload_map, dict) and key in tmdb_payload_map:
+            payload = tmdb_payload_map.get(key)
+        elif payload_json:
+            try:
+                raw = json.loads(payload_json)
+            except Exception:
+                raw = None
+            payload = raw if isinstance(raw, dict) else None
+        episode_weekdays: list[int] = []
+        if isinstance(payload, dict):
+            try:
+                episode_weekdays = [
+                    int(x)
+                    for x in (infer_tv_episode_weekdays_from_details(payload) or [])
+                    if 1 <= int(x) <= 7
+                ]
+            except Exception:
+                episode_weekdays = []
+        out[key] = (episode_weekdays, update_weekdays)
+    return out
+
+
+def _normalize_weekdays(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    out: list[int] = []
+    for raw in value:
+        try:
+            day = int(raw)
+        except Exception:
+            continue
+        if 1 <= day <= 7 and day not in out:
+            out.append(day)
+    return out
+
+
+def _compute_would_run_today(
+    item,
+    *,
+    tmdb_is_ended: bool | None,
+    episode_weekdays: list[int],
+    update_weekdays: list[int],
+) -> bool:
+    """与 drama_executor 调度规则对齐：今日是否会触发追剧任务。"""
+    if not bool(getattr(item, "enabled", False)):
+        return False
+    if tmdb_is_ended is True:
+        return False
+    try:
+        extra = json.loads(getattr(item, "extra_json", None) or "{}")
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    if bool(extra.get("ended")):
+        return False
+
+    enddate_raw = str(getattr(item, "enddate", "") or "").strip()
+    if enddate_raw:
+        try:
+            end_d = datetime.strptime(enddate_raw[:10], "%Y-%m-%d").date()
+            if datetime.now().date() > end_d:
+                return False
+        except Exception:
+            pass
+
+    today = datetime.now().isoweekday()
+    mode = str(extra.get("runweek_mode") or "manual").strip().lower()
+    if mode == "auto":
+        tmdb_id = int(getattr(item, "tmdb_id", 0) or 0)
+        media_type = str(getattr(item, "tmdb_media_type", "") or "").strip().lower()
+        if tmdb_id <= 0 or media_type != "tv":
+            return False
+        week = set(episode_weekdays or update_weekdays or [])
+        if not week:
+            return False
+        return today in week
+
+    runweek = _normalize_weekdays(extra.get("runweek"))
+    # 未配置星期：默认每天可跑
+    if not runweek:
+        return True
+    return today in set(runweek)
+
+
 def _load_savepath_snapshot_map(db: Session, items: list[object]) -> dict[str, TaskSavepathSnapshot]:
     task_uids: list[str] = []
     seen: set[str] = set()
@@ -294,6 +430,7 @@ def _task_out(
     *,
     tmdb_status_map: dict[tuple[str, int], str | None] | None = None,
     tmdb_payload_map: dict[tuple[str, int], dict[str, object] | None] | None = None,
+    tmdb_weekdays_map: dict[tuple[str, int], tuple[list[int], list[int]]] | None = None,
     snapshot_map: dict[str, TaskSavepathSnapshot] | None = None,
     sync_task_uids_map: dict[str, list[str]] | None = None,
 ) -> TaskOut:
@@ -315,6 +452,8 @@ def _task_out(
     tmdb_status: str | None = None
     tmdb_is_ended: bool | None = None
     drama_update_progress = None
+    episode_weekdays: list[int] = []
+    update_weekdays: list[int] = []
     key = _tmdb_cache_key(item)
     if key is not None:
         tmdb_status = tmdb_status_map.get(key) if isinstance(tmdb_status_map, dict) else _get_tmdb_status(db, key[0], key[1])
@@ -332,6 +471,22 @@ def _task_out(
                     tmdb_details=tmdb_payload_map.get(key),
                     snapshot=snapshot,
                 )
+        if isinstance(tmdb_weekdays_map, dict) and key in tmdb_weekdays_map:
+            episode_weekdays, update_weekdays = tmdb_weekdays_map.get(key) or ([], [])
+        elif key[0] == "tv" and str(getattr(item, "task_type", "") or "") == "drama":
+            solo = _load_tmdb_weekdays_map(
+                db,
+                [item],
+                tmdb_payload_map=tmdb_payload_map if isinstance(tmdb_payload_map, dict) else None,
+            )
+            episode_weekdays, update_weekdays = solo.get(key) or ([], [])
+
+    would_run_today = _compute_would_run_today(
+        item,
+        tmdb_is_ended=tmdb_is_ended,
+        episode_weekdays=episode_weekdays,
+        update_weekdays=update_weekdays,
+    )
 
     return TaskOut(
         id=item.id,
@@ -367,6 +522,9 @@ def _task_out(
         tmdb_status=tmdb_status,
         tmdb_is_ended=tmdb_is_ended,
         drama_update_progress=drama_update_progress,
+        tmdb_episode_weekdays=list(episode_weekdays or []),
+        tmdb_update_weekdays=list(update_weekdays or []),
+        would_run_today=bool(would_run_today),
         enabled=item.enabled,
         addition=json.loads(item.addition_json) if item.addition_json else {},
         extra=json.loads(item.extra_json) if item.extra_json else {},
@@ -639,6 +797,7 @@ def get_tasks(db: Session = Depends(get_db)):
     items = list_tasks_recent_executions(db, limit=3)
     tmdb_status_map = _load_tmdb_status_map(db, items)
     tmdb_payload_map = _load_tmdb_payload_map(db, items)
+    tmdb_weekdays_map = _load_tmdb_weekdays_map(db, items, tmdb_payload_map=tmdb_payload_map)
     snapshot_map = _load_savepath_snapshot_map(db, items)
     sync_task_uids_map = _load_sync_task_uids_map(db, items)
     return [
@@ -647,6 +806,7 @@ def get_tasks(db: Session = Depends(get_db)):
             item,
             tmdb_status_map=tmdb_status_map,
             tmdb_payload_map=tmdb_payload_map,
+            tmdb_weekdays_map=tmdb_weekdays_map,
             snapshot_map=snapshot_map,
             sync_task_uids_map=sync_task_uids_map,
         )

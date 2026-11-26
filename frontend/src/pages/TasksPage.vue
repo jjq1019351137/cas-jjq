@@ -712,7 +712,7 @@ async function handleImportFile(ev: Event) {
       </div>
 
       <!-- Loading -->
-      <div v-if="isLoading" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <div v-if="isLoading" class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         <Skeleton v-for="i in 6" :key="i" class="h-52 rounded-[1.15rem]" />
       </div>
 
@@ -749,7 +749,7 @@ async function handleImportFile(ev: Event) {
             <h2 class="group-head__label">{{ group.label }}</h2>
             <span class="filter-pill__count">{{ group.tasks.length }}</span>
           </div>
-          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             <TaskCard
               v-for="task in group.tasks"
               :key="task.id"

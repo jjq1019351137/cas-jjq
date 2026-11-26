@@ -163,6 +163,24 @@ const accountLabel = computed(() => {
 })
 
 const syncCount = computed(() => (props.task.sync_task_uids || []).length)
+
+/** 今日是否会触发：优先用后端 would_run_today（含 TMDB 周几） */
+const isScheduledToday = computed(() => Boolean(props.task.would_run_today))
+
+/** 链接全部失效 */
+const allLinksInvalid = computed(() => {
+  if (String(props.task.shareurl_ban || '').trim()) return true
+  const links = props.task.shareurls || []
+  if (!links.length) return false
+  return links.every((x) => String(x.status || '').toLowerCase() === 'invalid')
+})
+
+/** 底部强调：失效优先于今日计划 */
+const footTone = computed<'danger' | 'today' | null>(() => {
+  if (allLinksInvalid.value) return 'danger'
+  if (isScheduledToday.value) return 'today'
+  return null
+})
 </script>
 
 <template>
@@ -236,15 +254,21 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
     </div>
 
     <!-- 最近执行 + 操作 -->
-    <footer class="drama-card__foot">
+    <footer
+      class="drama-card__foot"
+      :class="{
+        'drama-card__foot--today': footTone === 'today',
+        'drama-card__foot--danger': footTone === 'danger',
+      }"
+      :title="footTone === 'today' ? '今日会触发（按 TMDB/调度规则）' : footTone === 'danger' ? '链接全部失效' : undefined"
+    >
       <span class="drama-card__exec" :class="`drama-card__exec--${lastExecTone}`" :title="lastExecTitle">
-        <History class="h-3.5 w-3.5 shrink-0" />
+        <History class="h-3 w-3 shrink-0" />
         <span class="truncate">{{ lastExecLabel }}</span>
       </span>
       <div class="drama-card__actions">
-        <!-- 对齐「运行一次」语义：带 allow_once 忽略按星期运行限制，点击即执行 -->
         <button type="button" class="icon-action" title="运行一次" @click="emit('run-once', task)">
-          <Play class="h-3.5 w-3.5" />
+          <Play class="h-3 w-3" />
         </button>
         <button
           type="button"
@@ -253,13 +277,13 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
           :title="task.enabled ? '暂停' : '启用'"
           @click="emit('toggle-status', task)"
         >
-          <Power class="h-3.5 w-3.5" />
+          <Power class="h-3 w-3" />
         </button>
         <button type="button" class="icon-action" title="编辑" @click="emit('edit', task)">
-          <Pencil class="h-3.5 w-3.5" />
+          <Pencil class="h-3 w-3" />
         </button>
         <button type="button" class="icon-action icon-action--danger" title="删除" @click="emit('delete', task)">
-          <Trash2 class="h-3.5 w-3.5" />
+          <Trash2 class="h-3 w-3" />
         </button>
       </div>
     </footer>
@@ -271,8 +295,9 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
 .drama-card {
   display: flex;
   flex-direction: column;
-  gap: 0.7rem;
-  padding: 0.95rem 1rem 0.8rem;
+  gap: 0.45rem;
+  padding: 0.65rem 0.75rem 0;
+  overflow: hidden;
 }
 
 .drama-card--off {
@@ -289,7 +314,7 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
 .drama-card__title {
   flex: 1;
   min-width: 0;
-  font-size: 0.9rem;
+  font-size: 0.82rem;
   font-weight: 600;
   letter-spacing: -0.01em;
   color: hsl(var(--foreground));
@@ -308,8 +333,8 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
 .drama-card__progress {
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.55rem 0.65rem;
+  gap: 0.3rem;
+  padding: 0.4rem 0.5rem;
 }
 
 .drama-card__progress--empty {
@@ -423,17 +448,30 @@ const syncCount = computed(() => (props.task.sync_task_uids || []).length)
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.5rem;
-  padding-top: 0.5rem;
+  gap: 0.4rem;
+  margin: 0.15rem -0.75rem 0;
+  padding: 0.4rem 0.65rem;
   border-top: 1px solid hsl(var(--border));
+  border-radius: 0 0 0.85rem 0.85rem;
+  transition: background-color 0.2s ease;
+}
+
+.drama-card__foot--today {
+  background: hsl(145 70% 42% / 0.42);
+  border-top-color: hsl(145 70% 42% / 0.55);
+}
+
+.drama-card__foot--danger {
+  background: hsl(0 75% 48% / 0.4);
+  border-top-color: hsl(0 75% 48% / 0.5);
 }
 
 .drama-card__exec {
   display: inline-flex;
   align-items: center;
-  gap: 0.3rem;
+  gap: 0.25rem;
   min-width: 0;
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   color: hsl(var(--foreground) / 0.7);
 }
 
