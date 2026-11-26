@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 from app.api.routes.tasks import post_share_preview
 from app.core.errors import ApiError, bad_request, not_found
 from app.extensions.adapters.adapter_factory import AdapterFactory
-from app.extensions.adapters.aliyun_adapter import AliyunAdapter
 from app.extensions.adapters.drive_auth import DriveAuthRequired
 from app.extensions.runtime.account_manager import DatabaseAccountManager
 from app.extensions.runtime.adapter_registry import AdapterRegistry
@@ -1391,17 +1390,30 @@ class TelegramBotActions:
 
     def start_account_auth(self, account_id: int) -> dict[str, Any]:
         account = get_drive_account(self.db, int(account_id))
-        if str(account.drive_type or "") == "aliyun":
-            resp = AliyunAdapter.generate_qrcode()
+        adapter_class = AdapterFactory.ADAPTER_MAP.get(str(account.drive_type or "").strip().lower())
+        if adapter_class is not None and hasattr(adapter_class, "start_tv_qrcode_auth"):
+            config = AdapterRegistry.parse_config_json(account.drive_type, account.config_json, account.cookie)
+            resp = adapter_class.start_tv_qrcode_auth(config)
             if not isinstance(resp, dict) or not resp.get("success"):
-                raise bad_request("DRIVE_ACCOUNT_AUTH_FAILED", "生成二维码失败", detail=str((resp or {}).get("message") or ""))
+                raise bad_request("DRIVE_ACCOUNT_AUTH_FAILED", "生成 TV 二维码失败", detail=str((resp or {}).get("message") or ""))
             data = resp.get("data") or {}
+            session_adapter = {
+                "device_id": str(data.get("device_id") or config.get("device_id") or ""),
+                "query_token": str(data.get("query_token") or config.get("query_token") or ""),
+            }
             session = create_auth_session(
                 account_id=account.id,
                 drive_type=account.drive_type,
                 method="qrcode",
-                adapter={"t": data.get("t") or "", "ck": data.get("ck") or ""},
-                payload={"qrcode_url": data.get("qrCodeUrl") or "", "status": "NEW"},
+                adapter=session_adapter,
+                payload={
+                    "qrcode_url": data.get("qrcode_url") or "",
+                    "qrcode_image": data.get("qrcode_image") or data.get("qrcode_url") or "",
+                    "status": str(data.get("status") or "NEW"),
+                    "message": str(data.get("message") or "等待扫码"),
+                    "device_id": session_adapter["device_id"],
+                    "query_token": session_adapter["query_token"],
+                },
             )
             return {
                 "account_id": int(account.id),
@@ -1440,10 +1452,12 @@ class TelegramBotActions:
             raise not_found("DRIVE_ACCOUNT_AUTH_SESSION_NOT_FOUND", "认证会话已失效")
         if session.method != "qrcode":
             raise bad_request("DRIVE_ACCOUNT_AUTH_METHOD_MISMATCH", "认证方式不匹配")
-        meta = session.adapter or {}
-        resp = AliyunAdapter.query_qrcode_status(str(meta.get("t") or ""), str(meta.get("ck") or ""))
+        adapter_class = AdapterFactory.ADAPTER_MAP.get(str(session.drive_type or "").strip().lower())
+        if adapter_class is None or not hasattr(adapter_class, "poll_tv_qrcode_auth"):
+            raise bad_request("DRIVE_ACCOUNT_AUTH_UNSUPPORTED", "当前账号不支持扫码认证")
+        resp = adapter_class.poll_tv_qrcode_auth(session.adapter or {})
         if not isinstance(resp, dict) or not resp.get("success"):
-            raise bad_request("DRIVE_ACCOUNT_AUTH_FAILED", "查询二维码状态失败", detail=str((resp or {}).get("message") or ""))
+            raise bad_request("DRIVE_ACCOUNT_AUTH_FAILED", "查询 TV 二维码状态失败", detail=str((resp or {}).get("message") or ""))
         data = resp.get("data") or {}
         if str(data.get("status") or "") == "CONFIRMED" and str(data.get("refresh_token") or ""):
             delete_auth_session(session_id)
@@ -1452,6 +1466,10 @@ class TelegramBotActions:
                 raise not_found("DRIVE_ACCOUNT_NOT_FOUND", "驱动账号不存在")
             config = AdapterRegistry.parse_config_json(account.drive_type, account.config_json, account.cookie)
             config["refresh_token"] = str(data.get("refresh_token") or "")
+            if str(data.get("device_id") or "").strip():
+                config["device_id"] = str(data.get("device_id") or "").strip()
+            if str(data.get("query_token") or "").strip():
+                config["query_token"] = str(data.get("query_token") or "").strip()
             update_drive_account(self.db, account.id, config=config)
             self.db.commit()
             account = probe_drive_account(self.db, account.id)

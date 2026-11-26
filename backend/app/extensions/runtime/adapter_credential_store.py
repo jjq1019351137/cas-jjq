@@ -94,10 +94,7 @@ def make_config_saver(drive_type: str):
 
 
 def install_adapter_config_savers() -> None:
-    from app.extensions.adapters import aliyun_adapter, cloud189_adapter, pan123_adapter, xunlei_adapter
+    from app.extensions.adapters import cloud189_adapter
 
-    xunlei_adapter.set_config_saver(make_config_saver("xunlei"))
-    aliyun_adapter.set_config_saver(make_config_saver("aliyun"))
     cloud189_adapter.set_config_saver(make_config_saver("cloud189"))
-    pan123_adapter.set_config_saver(make_config_saver("123pan"))
-    logger.info("[credential_store] 已接入 token 落库回调: xunlei/aliyun/cloud189/123pan")
+    logger.info("[credential_store] 已接入 token 落库回调: cloud189")

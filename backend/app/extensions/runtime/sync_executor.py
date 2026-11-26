@@ -422,6 +422,7 @@ class SyncExecutor:
 
         now = datetime.now()
         initial_stats: dict[str, Any] = {
+            "sync_task_id": int(task_id),
             "total_files": 0,
             "done_files": 0,
             "copied_files": 0,
@@ -1332,6 +1333,7 @@ class SyncExecutor:
         display_path: Callable[[Endpoint, str], str],
         on_file_update: Callable[..., None],
         cancel_checker: _CancelChecker | None,
+        force_immediate_delete: bool = False,
     ) -> None:
         if not actions:
             return
@@ -1447,9 +1449,10 @@ class SyncExecutor:
         # 1) 先复制
         _dispatch(copy_actions + other_actions)
 
-        # 2) 单向删除多余：延时>0 时落盘并由独立调度触发，避免占用同步进程
+        # 2) 单向删除多余：延时>0 时落盘并由独立调度触发，避免占用同步进程。
+        # force_immediate_delete=True 用于延时任务到期执行，禁止再次进入调度分支。
         if delete_actions:
-            delay_min = int(getattr(strategy, "one_way_delete_extras_delay_minutes", 5) or 0)
+            delay_min = 0 if force_immediate_delete else int(getattr(strategy, "one_way_delete_extras_delay_minutes", 5) or 0)
             if delay_min > 0:
                 from app.services.deferred_sync_delete import schedule_deferred_sync_deletes
 
@@ -1457,7 +1460,7 @@ class SyncExecutor:
                 log.section("删除多余文件延时（独立任务）")
                 log.line(f"已调度：{delay_min} 分钟后删除 {len(delete_actions)} 项多余文件")
                 job = schedule_deferred_sync_deletes(
-                    sync_task_id=0,
+                    sync_task_id=int(stats.get("sync_task_id") or 0),
                     execution_id=int(sync_execution_id or 0),
                     delay_minutes=delay_min,
                     actions=delete_actions,

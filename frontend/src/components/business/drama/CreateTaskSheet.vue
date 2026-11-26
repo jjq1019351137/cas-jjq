@@ -5,6 +5,7 @@ import { Input } from '@/components/ui/input'
 import {
   X, Eye, Loader2, Folder, FolderOpen, Search,
   Play, ArrowUp, ArrowDown, FileText, GripVertical, BookOpen, Check,
+  ChevronDown, ChevronRight,
 } from 'lucide-vue-next'
 import { previewShare, previewShareBatch, browseDrive, fetchTasks } from '@/api/tasks'
 import type { TaskSuggestionItem } from '@/types/resourceSearch'
@@ -189,6 +190,18 @@ function togglePluginEnabled(key: string, event: Event) {
     const { [key]: _, ...rest } = state.addition
     state.addition = rest
   }
+}
+
+/** 插件详细字段默认折叠，点击标题展开 */
+const expandedPluginKeys = ref<Set<string>>(new Set())
+function isPluginExpanded(key: string): boolean {
+  return expandedPluginKeys.value.has(key)
+}
+function togglePluginExpanded(key: string) {
+  const next = new Set(expandedPluginKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedPluginKeys.value = next
 }
 
 // Builtin rename rules —— 从后端 /tasks/magic-regex 拉取。
@@ -781,6 +794,13 @@ function initAdditionFromTask(taskAddition: Record<string, any> | undefined | nu
 }
 
 // Watch savepath manual edits
+watch(
+  () => props.open,
+  (open) => {
+    if (open) expandedPluginKeys.value = new Set()
+  },
+)
+
 watch(() => state.savepath, (newVal) => {
   if (newVal && newVal !== savepathLastApplied.value) {
     savepathTouched.value = true
@@ -2089,7 +2109,7 @@ function getTmdbPoster(item: TMDBBrief): string {
             </div>
             </div>
 
-            <!-- ===== 下部并联：插件 + 调度（插件字段平铺，无需展开） ===== -->
+            <!-- ===== 下部并联：插件 + 调度（插件字段默认折叠） ===== -->
             <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
             <section v-if="plugins.length > 0" class="space-y-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-3">
               <h3 class="section-heading">
@@ -2102,8 +2122,16 @@ function getTmdbPoster(item: TMDBBrief): string {
                   class="space-y-2 rounded-[0.6rem] border border-[hsl(var(--border))] bg-[hsl(var(--background))] p-3"
                 >
                   <div class="flex items-center justify-between gap-2">
-                    <span class="text-sm font-medium text-[hsl(var(--foreground))]">{{ plugin.plugin_key }}</span>
-                    <label class="inline-flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]">
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1 text-sm font-medium text-[hsl(var(--foreground))] hover:opacity-80"
+                      @click="togglePluginExpanded(plugin.plugin_key)"
+                    >
+                      <ChevronDown v-if="isPluginExpanded(plugin.plugin_key)" class="h-3.5 w-3.5 text-[hsl(var(--muted-foreground))]" />
+                      <ChevronRight v-else class="h-3.5 w-3.5 text-[hsl(var(--muted-foreground))]" />
+                      {{ plugin.plugin_key }}
+                    </button>
+                    <label class="inline-flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]" @click.stop>
                       启用
                       <input
                         type="checkbox"
@@ -2113,7 +2141,7 @@ function getTmdbPoster(item: TMDBBrief): string {
                       />
                     </label>
                   </div>
-                  <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <div v-if="isPluginExpanded(plugin.plugin_key)" class="grid grid-cols-1 gap-2 sm:grid-cols-2">
                     <div
                       v-for="field in plugin.task_config_fields"
                       :key="field.key"

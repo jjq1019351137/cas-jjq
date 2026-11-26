@@ -44,6 +44,23 @@ export async function deleteSyncTask(syncTaskId: number) {
   return data
 }
 
+export async function exportSyncTasks() {
+  const { data } = await http.get<Record<string, any>>('/sync-tasks/export')
+  return data
+}
+
+export async function importSyncTasks(payload: Record<string, any>, mode: 'skip' | 'upsert' = 'skip') {
+  const { data } = await http.post<{
+    ok: boolean
+    created: number
+    updated: number
+    skipped: number
+    failed: Array<{ name?: string; error?: string }>
+    total: number
+  }>('/sync-tasks/import', { ...payload, mode }, { headers: { 'X-Silent-Toast': '1' } })
+  return data
+}
+
 export async function fetchSyncExecutions(syncTaskId: number) {
   const { data } = await http.get<SyncExecutionItem[]>(`/sync-tasks/${syncTaskId}/executions`)
   return data

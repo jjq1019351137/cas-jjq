@@ -95,16 +95,19 @@ class TaskSchedulerManager:
         except Exception as e:
             logger.error(f"同步执行兜底调度加载失败: {e}")
         try:
+            from apscheduler.triggers.interval import IntervalTrigger
+
             from app.services.deferred_sync_delete import process_due_deferred_sync_deletes
 
+            # 与同步任务联动的延时删除兜底轮询（不依赖 OpenList 清理）
             self.scheduler.add_job(
                 process_due_deferred_sync_deletes,
-                trigger=CronTrigger(minute="*", timezone="Asia/Shanghai"),
+                trigger=IntervalTrigger(seconds=30, timezone="Asia/Shanghai"),
                 id="deferred_sync_delete_poll",
                 replace_existing=True,
                 max_instances=1,
                 coalesce=True,
-                misfire_grace_time=30,
+                misfire_grace_time=60,
             )
         except Exception as e:
             logger.error(f"延时删除轮询调度加载失败: {e}")

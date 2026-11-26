@@ -11,49 +11,25 @@ from typing import Any, Dict, List, Optional, Type
 
 from app.extensions.adapters.base_adapter import BaseCloudDriveAdapter
 from app.extensions.adapters.quark_adapter import QuarkAdapter
-from app.extensions.adapters.cloud115_adapter import Cloud115Adapter
-from app.extensions.adapters.baidu_adapter import BaiduAdapter
-from app.extensions.adapters.xunlei_adapter import XunleiAdapter
-from app.extensions.adapters.aliyun_adapter import AliyunAdapter
-from app.extensions.adapters.uc_adapter import UCAdapter
-from app.extensions.adapters.pan123_adapter import Pan123Adapter
 from app.extensions.adapters.cloud189_adapter import Cloud189Adapter
-from app.extensions.adapters.cloud139_adapter import Cloud139Adapter
-from app.extensions.adapters.guangya_adapter import GuangyaAdapter
 
 
 logger = logging.getLogger(__name__)
 
 
 class AdapterFactory:
-    """适配器工厂"""
+    """适配器工厂（仅夸克 / 天翼）"""
 
     # 适配器映射表
     ADAPTER_MAP: Dict[str, Type[BaseCloudDriveAdapter]] = {
         "quark": QuarkAdapter,
-        "115": Cloud115Adapter,
-        "baidu": BaiduAdapter,
-        "xunlei": XunleiAdapter,
-        "aliyun": AliyunAdapter,
-        "uc": UCAdapter,
-        "123pan": Pan123Adapter,
         "cloud189": Cloud189Adapter,
-        "cloud139": Cloud139Adapter,
-        "guangya": GuangyaAdapter,
     }
 
     # URL 模式映射
     URL_PATTERNS: Dict[str, str] = {
         r"pan\.quark\.cn": "quark",
-        r"(?:115|anxia|115cdn)\.com": "115",  # 115网盘有多个域名
-        r"pan\.baidu\.com": "baidu",
-        r"pan\.xunlei\.com": "xunlei",
-        r"(?:alipan|aliyundrive)\.com": "aliyun",
-        r"drive\.uc\.cn": "uc",
-        r"(?:(?:123pan|123865|123684|123952|123912)\.(?:com|cn)|(?:[A-Za-z0-9-]+\.)?share\.123pan\.cn)": "123pan",
         r"(?:cloud|m\.cloud)\.189\.cn": "cloud189",
-        r"(?:yun|caiyun)\.139\.com": "cloud139",
-        r"(?:www\.|app\.)?guangyapan\.com": "guangya",
     }
 
     # 实例缓存: (drive_type, config_hash) -> adapter_instance

@@ -8,9 +8,9 @@ type ApiErrorBody = {
 }
 
 /** 支持 TV 扫码登录的驱动（同时也支持普通扫码流程） */
-export const TV_QRCODE_DRIVES = ['quark', 'uc']
+export const TV_QRCODE_DRIVES = ['quark']
 /** 支持扫码登录的驱动 */
-export const QRCODE_DRIVES = ['aliyun', ...TV_QRCODE_DRIVES]
+export const QRCODE_DRIVES = [...TV_QRCODE_DRIVES]
 
 export function normalizeDriveType(driveType?: string | null) {
   return String(driveType || '').trim().toLowerCase()

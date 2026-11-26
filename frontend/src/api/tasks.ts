@@ -92,6 +92,23 @@ export async function deleteTask(taskId: number) {
   return data
 }
 
+export async function exportDramaTasks() {
+  const { data } = await http.get<Record<string, any>>('/tasks/export')
+  return data
+}
+
+export async function importDramaTasks(payload: Record<string, any>, mode: 'skip' | 'upsert' = 'skip') {
+  const { data } = await http.post<{
+    ok: boolean
+    created: number
+    updated: number
+    skipped: number
+    failed: Array<{ taskname?: string; error?: string }>
+    total: number
+  }>('/tasks/import', { ...payload, mode }, { headers: { 'X-Silent-Toast': '1' } })
+  return data
+}
+
 export async function fetchTaskSchedulerSetting() {
   const { data } = await http.get<TaskSchedulerSetting>('/tasks/scheduler')
   return data

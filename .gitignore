@@ -19,6 +19,8 @@ backend/tests
 backend/data/*.db.*
 backend/data/*.db*
 backend/data/cache
+backend/data/secrets.json
+backend/data/deferred_sync_deletes/
 docs
 backend/data/sync/*
 .dbg

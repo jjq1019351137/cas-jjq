@@ -206,6 +206,50 @@ def post_cancel_sync_execution(
     return _execution_out(execution)
 
 
+@router.get("/export", dependencies=[Depends(require_permissions(SYNC_READ))])
+def export_sync_tasks_json(db: Session = Depends(get_db)):
+    from app.services.task_bundle_migration import export_sync_tasks
+
+    return export_sync_tasks(db)
+
+
+@router.post("/import", dependencies=[Depends(require_permissions(SYNC_WRITE))])
+def import_sync_tasks_json(
+    request: Request,
+    payload: dict,
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.schemas.task_bundle import TaskImportResultOut
+    from app.services.task_bundle_migration import import_sync_tasks
+
+    raw = payload if isinstance(payload, dict) else {}
+    mode = str(raw.get("mode") or "skip")
+    if isinstance(raw.get("payload"), dict) and (
+        "tasks" in raw["payload"] or "sync_tasks" in raw["payload"] or raw["payload"].get("format")
+    ):
+        data = raw["payload"]
+    else:
+        data = raw
+    result = import_sync_tasks(db, data, mode=mode)
+    audit.write_audit_log(
+        db,
+        actor_user_id=current.user.id,
+        action="sync_tasks.import",
+        target_type="sync_task",
+        target_id="*",
+        ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        success=True,
+        detail=json.dumps(
+            {"created": result.get("created"), "updated": result.get("updated"), "skipped": result.get("skipped")},
+            ensure_ascii=False,
+        ),
+    )
+    db.commit()
+    return TaskImportResultOut(**result)
+
+
 @router.get("", response_model=list[SyncTaskOut], dependencies=[Depends(require_permissions(SYNC_READ))])
 def get_sync_tasks(current: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = list_sync_tasks(db)

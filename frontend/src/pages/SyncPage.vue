@@ -13,11 +13,11 @@ import {
   AlertDialogAction,
   AlertDialogCancel,
 } from '@/components/ui/alert-dialog'
-import { Plus, FileCheck } from 'lucide-vue-next'
+import { Plus, FileCheck, Download, Upload } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { useSyncTasksQuery } from '@/hooks/queries/sync'
 import { useDeleteSyncTaskMutation, useUpdateSyncTaskMutation, useCancelSyncExecutionMutation } from '@/hooks/mutations/sync'
-import { fetchSyncExecutions, fetchSyncExecutionLatest } from '@/api/syncTasks'
+import { exportSyncTasks, fetchSyncExecutions, fetchSyncExecutionLatest, importSyncTasks } from '@/api/syncTasks'
 import type { SyncTaskItem } from '@/types/syncTasks'
 import SyncTaskCard from '@/components/business/sync/SyncTaskCard.vue'
 import CreateSyncSheet from '@/components/business/sync/CreateSyncSheet.vue'
@@ -33,6 +33,9 @@ const cancelMutation = useCancelSyncExecutionMutation()
 const selectedTaskId = ref<number | null>(null)
 const sheetOpen = ref(false)
 const editingTask = ref<SyncTaskItem | null>(null)
+const importFileInput = ref<HTMLInputElement | null>(null)
+const importBusy = ref(false)
+const exportBusy = ref(false)
 
 // Stream log dialog state
 const streamLogVisible = ref(false)
@@ -181,6 +184,49 @@ function openCreateSheet() {
   sheetOpen.value = true
 }
 
+async function handleExportTasks() {
+  exportBusy.value = true
+  try {
+    const data = await exportSyncTasks()
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `cas-jjq-sync-tasks-${new Date().toISOString().slice(0, 10)}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success(`已导出 ${Number(data?.count || 0)} 个同步任务`)
+  } catch (e: any) {
+    toast.error(e?.message || '导出失败')
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+function handleImportClick() {
+  importFileInput.value?.click()
+}
+
+async function handleImportFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  importBusy.value = true
+  try {
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const result = await importSyncTasks(payload, 'skip')
+    await refetchTasks()
+    const failN = result.failed?.length || 0
+    toast.success(`导入完成：新建 ${result.created}，跳过 ${result.skipped}，失败 ${failN}`)
+  } catch (e: any) {
+    toast.error(e?.message || '导入失败')
+  } finally {
+    importBusy.value = false
+  }
+}
+
 function formatDuration(start: string, end?: string | null): string {
   if (!end) return '进行中'
   const ms = new Date(end).getTime() - new Date(start).getTime()
@@ -220,10 +266,21 @@ function execStatusClass(status: string): string {
         <h1 class="text-2xl font-bold text-[hsl(var(--foreground))]">🔄 同步任务</h1>
         <p class="mt-0.5 text-sm text-[hsl(var(--muted-foreground))]">本地与网盘之间的文件同步编排</p>
       </div>
-      <Button @click="openCreateSheet">
-        <Plus class="mr-1.5 h-4 w-4" />
-        新建同步任务
-      </Button>
+      <div class="flex items-center gap-2">
+        <Button variant="outline" :disabled="exportBusy" @click="handleExportTasks">
+          <Download class="mr-1.5 h-4 w-4" />
+          导出 JSON
+        </Button>
+        <Button variant="outline" :disabled="importBusy" @click="handleImportClick">
+          <Upload class="mr-1.5 h-4 w-4" />
+          导入 JSON
+        </Button>
+        <input ref="importFileInput" type="file" accept="application/json,.json" class="hidden" @change="handleImportFile" />
+        <Button @click="openCreateSheet">
+          <Plus class="mr-1.5 h-4 w-4" />
+          新建同步任务
+        </Button>
+      </div>
     </div>
 
     <!-- Stat tiles -->

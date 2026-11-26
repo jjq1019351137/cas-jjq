@@ -61,7 +61,7 @@ def create_app() -> FastAPI:
     setup_logging()
     _prepare_db_environment()
     _ensure_proxy_image_cache_dir()
-    # 接入驱动 token 落库回调（xunlei/aliyun/cloud189/123pan 刷新、轮转后写回 drive_accounts）
+    # 接入驱动 token 落库回调（cloud189 刷新、轮转后写回 drive_accounts）
     install_adapter_config_savers()
 
     @asynccontextmanager

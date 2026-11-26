@@ -19,7 +19,7 @@ from app.models.sync_task_drama_link import SyncTaskDramaLink
 from app.services.dl302_settings import extract_dl302_sync_base_path
 
 
-DL302_SYNC_DRIVE_TYPES = {"115", "cloud139", "cloud189", "quark", "uc", "guangya"}
+DL302_SYNC_DRIVE_TYPES = {"cloud189", "quark"}
 
 
 def _local_sync_root() -> Path:

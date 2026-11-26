@@ -16,7 +16,10 @@ import {
 import {
   Plus, Search, Film, Play, Wrench, Square, Camera,
   HardDrive, User, HelpCircle, X, CalendarCheck, Save, FolderOpen, Loader2,
+  Download, Upload,
 } from 'lucide-vue-next'
+import { exportDramaTasks, importDramaTasks } from '@/api/tasks'
+import { useQueryClient } from '@tanstack/vue-query'
 import { browseOpenList } from '@/api/openlist'
 import TaskCard from '@/components/business/drama/TaskCard.vue'
 import DramaTaskLauncher from '@/components/business/drama/DramaTaskLauncher.vue'
@@ -39,6 +42,10 @@ import { resolveTaskAccount, type ResolvedTaskAccount } from '@/utils/taskAccoun
 
 const { toast } = useToast()
 const launcher = useDramaTaskLauncher()
+const queryClient = useQueryClient()
+const importFileInput = ref<HTMLInputElement | null>(null)
+const importBusy = ref(false)
+const exportBusy = ref(false)
 
 const searchQuery = ref('')
 const selectedDriveType = ref('')
@@ -373,6 +380,51 @@ function handleToggleStatus(task: TaskItem) {
   )
 }
 
+async function handleExportTasks() {
+  exportBusy.value = true
+  try {
+    const data = await exportDramaTasks()
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `cas-jjq-drama-tasks-${new Date().toISOString().slice(0, 10)}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success(`已导出 ${Number(data?.count || 0)} 个追剧任务`)
+  } catch (e: any) {
+    toast.error(e?.message || '导出失败')
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+function handleImportClick() {
+  importFileInput.value?.click()
+}
+
+async function handleImportFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  importBusy.value = true
+  try {
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const result = await importDramaTasks(payload, 'skip')
+    await queryClient.invalidateQueries({ queryKey: ['tasks'] })
+    const failN = result.failed?.length || 0
+    toast.success(
+      `导入完成：新建 ${result.created}，跳过 ${result.skipped}，失败 ${failN}`,
+    )
+  } catch (e: any) {
+    toast.error(e?.message || '导入失败')
+  } finally {
+    importBusy.value = false
+  }
+}
+
 </script>
 
 <template>
@@ -564,6 +616,13 @@ function handleToggleStatus(task: TaskItem) {
         <Button size="sm" variant="outline" class="rounded-full" :disabled="syncMutation.isPending.value" @click="handleSyncSnapshots">
           <Camera class="mr-1 h-3.5 w-3.5" /> 同步快照
         </Button>
+        <Button size="sm" variant="outline" class="rounded-full" :disabled="exportBusy" @click="handleExportTasks">
+          <Download class="mr-1 h-3.5 w-3.5" /> 导出 JSON
+        </Button>
+        <Button size="sm" variant="outline" class="rounded-full" :disabled="importBusy" @click="handleImportClick">
+          <Upload class="mr-1 h-3.5 w-3.5" /> 导入 JSON
+        </Button>
+        <input ref="importFileInput" type="file" accept="application/json,.json" class="hidden" @change="handleImportFile" />
         <div class="ml-auto flex items-center gap-2">
           <Button v-if="hasActiveFilters" size="sm" variant="ghost" class="rounded-full" @click="clearFilters">
             清空筛选
