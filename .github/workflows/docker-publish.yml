@@ -4,14 +4,14 @@ permissions:
   contents: write
   packages: write
 
+# 仅 main/master 推送触发，避免「推 main + 推 v* 标签」重复跑两次。
+# 若该提交已打 v* 标签，构建时仍会额外推送版本镜像标签与 latest。
 on:
   workflow_dispatch:
   push:
     branches:
       - main
       - master
-    tags:
-      - "v*"
 
 env:
   IMAGE_REPO: cas-jjq
@@ -36,6 +36,18 @@ jobs:
           fi
           echo "NAME=${user}/${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve version from git tag on this commit
+        id: get_version
+        run: |
+          exact_tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          if [[ "$exact_tag" == v* ]]; then
+            echo "VERSION=${exact_tag}" >> "$GITHUB_OUTPUT"
+            echo "HAS_RELEASE_TAG=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "HAS_RELEASE_TAG=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract metadata (tags, labels) for Docker Hub
         id: meta_dockerhub
         uses: docker/metadata-action@v5
@@ -44,8 +56,8 @@ jobs:
             ${{ steps.image.outputs.NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ steps.get_version.outputs.VERSION }},enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' }}
+            type=raw,value=latest,enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Extract metadata (tags, labels) for Aliyun
         id: meta_aliyun
@@ -55,17 +67,8 @@ jobs:
             ${{ env.ALIYUN_REGISTRY }}/${{ steps.image.outputs.NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-
-      - name: Get version
-        id: get_version
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          else
-            echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+            type=raw,value=${{ steps.get_version.outputs.VERSION }},enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' }}
+            type=raw,value=latest,enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -148,7 +151,7 @@ jobs:
 
       - name: Update repo description
         uses: peter-evans/dockerhub-description@v4
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
